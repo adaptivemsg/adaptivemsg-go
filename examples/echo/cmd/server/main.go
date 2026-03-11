@@ -35,7 +35,7 @@ func main() {
 			log.Printf("disconnect: %s", addr)
 			return nil
 		}).
-		OnNewStream(func(ctx *am.Context) {
+		OnNewStream(func(ctx *am.StreamContext) {
 			ctx.SetContext(mgr)
 			id := streamSeq.Add(1)
 			log.Printf("on new stream: %d", id)

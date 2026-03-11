@@ -38,32 +38,7 @@ type handlerJob struct {
 	msg     Message
 }
 
-type streamProxy struct {
-	c *Connection
-}
-
-func (p *streamProxy) Send(msg Message) error {
-	return p.c.defaultStream().Send(msg)
-}
-
-func (p *streamProxy) SendRecv(msg Message) (Message, error) {
-	return p.c.defaultStream().SendRecv(msg)
-}
-
-func (p *streamProxy) Recv() (Message, error) {
-	return p.c.defaultStream().Recv()
-}
-
-func (p *streamProxy) PeekWire() (string, error) {
-	return p.c.defaultStream().PeekWire()
-}
-
-func (p *streamProxy) SetRecvTimeout(timeout time.Duration) {
-	p.c.defaultStream().SetRecvTimeout(timeout)
-}
-
 type Connection struct {
-	*streamProxy
 	conn              net.Conn
 	registry          *registry
 	config            connConfig
@@ -73,8 +48,8 @@ type Connection struct {
 	nextStreamID      atomic.Uint32
 	defaultStreamOnce sync.Once
 	defaultStreamView *Stream[Message]
-	onNewStream       func(*Context)
-	onCloseStream     func(*Context)
+	onNewStream       func(*StreamContext)
+	onCloseStream     func(*StreamContext)
 	closeOnce         sync.Once
 	closeCh           chan struct{}
 	closed            atomic.Bool
@@ -84,7 +59,7 @@ type pendingConnection struct {
 	connection *Connection
 }
 
-func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onCloseStream func(*Context)) *pendingConnection {
+func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onCloseStream func(*StreamContext)) *pendingConnection {
 	if registry == nil {
 		registry = newRegistrySnapshot()
 	}
@@ -97,7 +72,6 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 		onCloseStream: onCloseStream,
 		closeCh:       make(chan struct{}),
 	}
-	connection.streamProxy = &streamProxy{c: connection}
 	connection.nextStreamID.Store(0)
 	return &pendingConnection{connection: connection}
 }
@@ -133,6 +107,26 @@ func (c *Connection) Close() {
 
 func (c *Connection) WaitClosed() {
 	<-c.closeCh
+}
+
+func (c *Connection) Send(msg Message) error {
+	return c.defaultStream().Send(msg)
+}
+
+func (c *Connection) SendRecv(msg Message) (Message, error) {
+	return c.defaultStream().SendRecv(msg)
+}
+
+func (c *Connection) Recv() (Message, error) {
+	return c.defaultStream().Recv()
+}
+
+func (c *Connection) PeekWire() (string, error) {
+	return c.defaultStream().PeekWire()
+}
+
+func (c *Connection) SetRecvTimeout(timeout time.Duration) {
+	c.defaultStream().SetRecvTimeout(timeout)
 }
 
 func (c *Connection) viewCore() *streamCore {
@@ -176,7 +170,7 @@ func (c *Connection) closeAllStreams() {
 	for _, streamCtx := range streams {
 		streamCtx.stream.core.close()
 		if c.onCloseStream != nil {
-			c.onCloseStream(streamCtx.context)
+			c.onCloseStream(streamCtx)
 		}
 	}
 }
@@ -191,7 +185,7 @@ func (c *Connection) removeStream(streamID uint32) {
 	}
 	streamCtx.stream.core.close()
 	if c.onCloseStream != nil {
-		c.onCloseStream(streamCtx.context)
+		c.onCloseStream(streamCtx)
 	}
 }
 
@@ -205,7 +199,7 @@ func (c *Connection) getStreamCtx(streamID uint32) *StreamContext {
 	streamCtx = c.makeStreamLocked(streamID)
 	c.streamsMu.Unlock()
 	if c.onNewStream != nil {
-		c.onNewStream(streamCtx.context)
+		c.onNewStream(streamCtx)
 	}
 	return streamCtx
 }
@@ -225,10 +219,8 @@ func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
 		handlerCh:  handlerCh,
 	}
 	stream := &Stream[Message]{core: core}
-	context := &Context{}
 	streamCtx := &StreamContext{
 		stream:  stream,
-		context: context,
 	}
 	c.streams[streamID] = streamCtx
 	if handlerCh != nil {

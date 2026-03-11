@@ -30,14 +30,6 @@ func NewErrorReply(code, message string) *ErrorReply {
 	return &ErrorReply{Code: code, Message: message}
 }
 
-func (e *ErrorReply) ErrorCode() string {
-	return e.Code
-}
-
-func (e *ErrorReply) ErrorMessage() string {
-	return e.Message
-}
-
 func WireNameOf(msg Message) (string, error) {
 	if msg == nil {
 		return "", ErrInvalidMessage{Reason: "message must be non-nil"}

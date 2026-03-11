@@ -9,13 +9,6 @@ import (
 	am "adaptivemsg"
 )
 
-type StatContext interface {
-	IncCounter()
-	Subscribe() chan string
-	Unsubscribe(chan string)
-	ListClients() string
-}
-
 func (msg *MessageRequest) Handle(ctx *am.StreamContext) (am.Message, error) {
 	mgr, err := statFromContext(ctx)
 	if err != nil {
@@ -73,8 +66,8 @@ func (msg *MessageTimeout) Handle(_ *am.StreamContext) (am.Message, error) {
 
 var _ = am.MustRegisterGlobalType[MessageTimeout]()
 
-func statFromContext(ctx *am.StreamContext) (StatContext, error) {
-	mgr, ok := am.ContextAs[StatContext](ctx.Context())
+func statFromContext(ctx *am.StreamContext) (*StatMgr, error) {
+	mgr, ok := am.ContextAs[*StatMgr](ctx)
 	if !ok || mgr == nil {
 		return nil, errors.New("missing stream context")
 	}

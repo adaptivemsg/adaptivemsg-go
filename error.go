@@ -136,10 +136,10 @@ func (e ErrInvalidMessage) Error() string {
 	return e.Reason
 }
 
-type ErrUnsupported struct {
+type ErrUnsupportedTransport struct {
 	Reason string
 }
 
-func (e ErrUnsupported) Error() string {
+func (e ErrUnsupportedTransport) Error() string {
 	return e.Reason
 }

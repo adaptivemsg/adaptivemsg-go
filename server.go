@@ -17,8 +17,8 @@ type Server struct {
 	registry      *registry
 	onConnect     func(Netconn) error
 	onDisconnect  func(Netconn) error
-	onNewStream   func(*Context)
-	onCloseStream func(*Context)
+	onNewStream   func(*StreamContext)
+	onCloseStream func(*StreamContext)
 }
 
 func NewServer() *Server {
@@ -37,12 +37,12 @@ func (s *Server) OnDisconnect(f func(Netconn) error) *Server {
 	return s
 }
 
-func (s *Server) OnNewStream(f func(*Context)) *Server {
+func (s *Server) OnNewStream(f func(*StreamContext)) *Server {
 	s.onNewStream = f
 	return s
 }
 
-func (s *Server) OnCloseStream(f func(*Context)) *Server {
+func (s *Server) OnCloseStream(f func(*StreamContext)) *Server {
 	s.onCloseStream = f
 	return s
 }

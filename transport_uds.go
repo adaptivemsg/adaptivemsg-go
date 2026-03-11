@@ -48,7 +48,7 @@ func normalizeUDSPath(path string) (string, error) {
 	}
 	if strings.HasPrefix(path, "@") {
 		if runtime.GOOS != "linux" {
-			return "", ErrUnsupported{Reason: "abstract UDS is only supported on linux"}
+			return "", ErrUnsupportedTransport{Reason: "abstract UDS is only supported on linux"}
 		}
 		return "\x00" + path[1:], nil
 	}

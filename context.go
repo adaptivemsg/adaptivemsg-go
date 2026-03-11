@@ -5,46 +5,34 @@ import (
 	"sync/atomic"
 )
 
-type Context struct {
-	mu   sync.Mutex
-	data any
+type StreamContext struct {
+	stream            *Stream[Message]
+	mu                sync.Mutex
+	data              any
+	handlerTaskActive atomic.Bool
 }
 
-func (c *Context) SetContext(value any) {
-	c.mu.Lock()
-	c.data = value
-	c.mu.Unlock()
+func (sc *StreamContext) SetContext(value any) {
+	sc.mu.Lock()
+	sc.data = value
+	sc.mu.Unlock()
 }
 
-func (c *Context) GetContext() any {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.data
+func (sc *StreamContext) GetContext() any {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.data
 }
 
-func ContextAs[T any](c *Context) (T, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	value, ok := c.data.(T)
+func ContextAs[T any](sc *StreamContext) (T, bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	value, ok := sc.data.(T)
 	var zero T
 	if !ok {
 		return zero, false
 	}
 	return value, true
-}
-
-type StreamContext struct {
-	stream            *Stream[Message]
-	context           *Context
-	handlerTaskActive atomic.Bool
-}
-
-func (sc *StreamContext) SetContext(value any) {
-	sc.context.SetContext(value)
-}
-
-func (sc *StreamContext) Context() *Context {
-	return sc.context
 }
 
 func (sc *StreamContext) NewTask(fn func(*Stream[Message])) error {

@@ -99,4 +99,4 @@ Notes:
 - Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
 - Message names default to `am.<package-leaf>.<TypeName>`; implement `WireName() string` on a type if you need an override.
-- Example servers rely on build-tagged handlers; run them with `-tags server` (for example: `go run -tags server ./examples/hello/server`).
+- Example servers rely on build-tagged handlers; run them with `-tags server` (for example: `go run -tags server ./examples/hello/cmd/server`).
