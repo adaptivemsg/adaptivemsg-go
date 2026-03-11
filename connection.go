@@ -34,7 +34,7 @@ type outboundFrame struct {
 }
 
 type handlerJob struct {
-	handler HandlerFunc
+	handler handlerFunc
 	msg     Message
 }
 
@@ -46,16 +46,16 @@ func (p *streamProxy) Send(msg Message) error {
 	return p.c.defaultStream().Send(msg)
 }
 
-func (p *streamProxy) SendRecvAny(msg Message) (Message, error) {
-	return p.c.defaultStream().SendRecvAny(msg)
-}
-
 func (p *streamProxy) SendRecv(msg Message) (Message, error) {
 	return p.c.defaultStream().SendRecv(msg)
 }
 
 func (p *streamProxy) Recv() (Message, error) {
 	return p.c.defaultStream().Recv()
+}
+
+func (p *streamProxy) PeekWire() (string, error) {
+	return p.c.defaultStream().PeekWire()
 }
 
 func (p *streamProxy) SetRecvTimeout(timeout time.Duration) {
@@ -65,7 +65,7 @@ func (p *streamProxy) SetRecvTimeout(timeout time.Duration) {
 type Connection struct {
 	*streamProxy
 	conn              net.Conn
-	registry          *Registry
+	registry          *registry
 	config            connConfig
 	outbound          chan outboundFrame
 	streams           map[uint32]*StreamContext
@@ -80,13 +80,13 @@ type Connection struct {
 	closed            atomic.Bool
 }
 
-type PendingConnection struct {
+type pendingConnection struct {
 	connection *Connection
 }
 
-func newPendingConnection(conn net.Conn, registry *Registry, onNewStream, onCloseStream func(*Context)) *PendingConnection {
+func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onCloseStream func(*Context)) *pendingConnection {
 	if registry == nil {
-		registry = NewRegistry()
+		registry = newRegistrySnapshot()
 	}
 	connection := &Connection{
 		conn:          conn,
@@ -99,14 +99,10 @@ func newPendingConnection(conn net.Conn, registry *Registry, onNewStream, onClos
 	}
 	connection.streamProxy = &streamProxy{c: connection}
 	connection.nextStreamID.Store(0)
-	return &PendingConnection{connection: connection}
+	return &pendingConnection{connection: connection}
 }
 
-func (p *PendingConnection) Connection() *Connection {
-	return p.connection
-}
-
-func (p *PendingConnection) StartClient(codec Codec, maxFrame uint32) (*Connection, error) {
+func (p *pendingConnection) startClient(codec Codec, maxFrame uint32) (*Connection, error) {
 	config, err := handshakeClient(p.connection.conn, codec, maxFrame)
 	if err != nil {
 		return nil, err
@@ -116,7 +112,7 @@ func (p *PendingConnection) StartClient(codec Codec, maxFrame uint32) (*Connecti
 	return p.connection, nil
 }
 
-func (p *PendingConnection) StartServer(maxFrame uint32) (*Connection, error) {
+func (p *pendingConnection) startServer(maxFrame uint32) (*Connection, error) {
 	config, err := handshakeServer(p.connection.conn, maxFrame)
 	if err != nil {
 		return nil, err
@@ -178,12 +174,9 @@ func (c *Connection) closeAllStreams() {
 	c.streams = make(map[uint32]*StreamContext)
 	c.streamsMu.Unlock()
 	for _, streamCtx := range streams {
+		streamCtx.stream.core.close()
 		if c.onCloseStream != nil {
 			c.onCloseStream(streamCtx.context)
-		}
-		close(streamCtx.stream.core.inbox)
-		if streamCtx.stream.core.handlerCh != nil {
-			close(streamCtx.stream.core.handlerCh)
 		}
 	}
 }
@@ -193,7 +186,11 @@ func (c *Connection) removeStream(streamID uint32) {
 	streamCtx := c.streams[streamID]
 	delete(c.streams, streamID)
 	c.streamsMu.Unlock()
-	if streamCtx != nil && c.onCloseStream != nil {
+	if streamCtx == nil {
+		return
+	}
+	streamCtx.stream.core.close()
+	if c.onCloseStream != nil {
 		c.onCloseStream(streamCtx.context)
 	}
 }
@@ -214,15 +211,17 @@ func (c *Connection) getStreamCtx(streamID uint32) *StreamContext {
 }
 
 func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
-	inbox := make(chan Message, streamQueueSize)
+	inbox := make(chan rawMessage, streamQueueSize)
+	incoming := make(chan []byte, streamQueueSize)
 	var handlerCh chan handlerJob
-	if c.registry.HasHandlers() {
+	if c.registry.hasHandlers() {
 		handlerCh = make(chan handlerJob, streamQueueSize)
 	}
 	core := &streamCore{
 		id:         streamID,
 		connection: c,
 		inbox:      inbox,
+		incoming:   incoming,
 		handlerCh:  handlerCh,
 	}
 	stream := &Stream[Message]{core: core}
@@ -235,6 +234,7 @@ func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
 	if handlerCh != nil {
 		go c.handlerLoop(streamCtx)
 	}
+	go c.decodeLoop(streamCtx)
 	return streamCtx
 }
 
@@ -254,16 +254,49 @@ func (c *Connection) handlerLoop(streamCtx *StreamContext) {
 	}
 }
 
-func (c *Connection) dispatchMessage(stream *streamCore, msg Message) error {
-	wire, err := WireNameOf(msg)
-	if err != nil {
-		return err
+func (c *Connection) decodeLoop(streamCtx *StreamContext) {
+	core := streamCtx.stream.core
+	for {
+		select {
+		case payload, ok := <-core.incoming:
+			if !ok {
+				return
+			}
+			raw, err := newRawMessageFromPayload(c.config.codec, payload)
+			if err != nil {
+				core.protocolError("codec_error", err.Error())
+				return
+			}
+			if err := c.dispatchMessage(core, raw); err != nil {
+				core.protocolError("codec_error", err.Error())
+				return
+			}
+		case <-c.closeCh:
+			return
+		}
 	}
-	if handler, ok := c.registry.Handler(wire); ok {
-		_ = stream.handlerQ(handlerJob{handler: handler, msg: msg})
+}
+
+func (c *Connection) dispatchMessage(stream *streamCore, raw rawMessage) error {
+	if handler, ok := c.registry.handler(raw.Wire); ok {
+		msg, err := decodeRawWithRegistry(raw, c.registry)
+		if err != nil {
+			return err
+		}
+		if err := stream.handlerQ(handlerJob{handler: handler, msg: msg}); err != nil {
+			if _, ok := err.(ErrClosed); ok {
+				return nil
+			}
+			return err
+		}
 		return nil
 	}
-	_ = stream.inboxQ(msg)
+	if err := stream.inboxQ(raw); err != nil {
+		if _, ok := err.(ErrClosed); ok {
+			return nil
+		}
+		return err
+	}
 	return nil
 }
 
@@ -289,12 +322,7 @@ func (c *Connection) readerLoop() {
 			return
 		}
 		streamCtx := c.getStreamCtx(streamID)
-		msg, err := c.decodeMessage(payload)
-		if err != nil {
-			c.markClosed()
-			return
-		}
-		if err := c.dispatchMessage(streamCtx.stream.core, msg); err != nil {
+		if err := streamCtx.stream.core.incomingQ(payload); err != nil {
 			c.markClosed()
 			return
 		}
@@ -328,7 +356,7 @@ func (c *Connection) decodeMap(payload []byte) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	factory, ok := c.registry.Message(wire)
+	factory, ok := c.registry.message(wire)
 	if !ok {
 		return nil, ErrUnknownMessage{Name: wire}
 	}
@@ -340,7 +368,7 @@ func (c *Connection) decodeCompact(payload []byte) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	factory, ok := c.registry.Message(wire)
+	factory, ok := c.registry.message(wire)
 	if !ok {
 		return nil, ErrUnknownMessage{Name: wire}
 	}

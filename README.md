@@ -5,13 +5,14 @@ Go runtime for the adaptivemsg wire protocol.
 This repository is the Go sibling of `adaptivemsg-rust` and is intended to stay
 in lockstep with the protocol defined in `adaptivemsg-doc`.
 
-## Minimal usage
+## Client/server example
 
 ```go
 package main
 
 import (
 	"fmt"
+	"log"
 
 	am "adaptivemsg"
 )
@@ -20,57 +21,82 @@ type HelloRequest struct {
 	Who string `msgpack:"who"`
 }
 
-type HelloReply struct {
-	Answer string `msgpack:"answer"`
-}
-
-func main() {
-	reg := am.NewRegistry()
-	_ = am.Handle[HelloRequest](reg, func(_ *am.StreamContext, req *HelloRequest) (am.Message, error) {
-		return &HelloReply{Answer: fmt.Sprintf("hi, %s", req.Who)}, nil
-	})
-}
-```
-
-## TCP server/client sketch
-
-```go
-package main
-
-import (
-	"fmt"
-
-	am "adaptivemsg"
-)
-
-type HelloRequest struct {
-	Who string `msgpack:"who"`
+type HelloInternal struct {
+	TraceID string `msgpack:"trace_id"`
 }
 
 type HelloReply struct {
-	Answer string `msgpack:"answer"`
+	Answer   string        `msgpack:"answer"`
+	Internal HelloInternal `msgpack:"internal"`
 }
+
+func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {
+	return &HelloReply{
+		Answer: fmt.Sprintf("hi, %s", msg.Who),
+		Internal: HelloInternal{
+			TraceID: "req-1",
+		},
+	}, nil
+}
+
+var _ = am.MustRegisterGlobalType[HelloRequest]()
 
 func main() {
 	// server
-	serverReg := am.NewRegistry()
-	_ = am.Handle[HelloRequest](serverReg, func(_ *am.StreamContext, req *HelloRequest) (am.Message, error) {
-		return &HelloReply{Answer: fmt.Sprintf("hi, %s", req.Who)}, nil
-	})
 	go func() {
-		_ = am.NewServer().WithRegistry(serverReg).Serve("tcp://0.0.0.0:5555")
+		if err := am.NewServer().Serve("tcp://0.0.0.0:5555"); err != nil {
+			log.Fatal(err)
+		}
 	}()
 
 	// client
 	client := am.NewClient()
 	conn, _ := client.Connect("tcp://127.0.0.1:5555")
 	reply, _ := am.SendRecvAs[*HelloReply](conn, &HelloRequest{Who: "alice"})
-	_ = reply
+	log.Printf("reply: %s (trace %s)", reply.Answer, reply.Internal.TraceID)
+}
+```
+
+## Dynamic receive
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	am "adaptivemsg"
+	"adaptivemsg/examples/echo"
+)
+
+var _ = am.MustRegisterGlobalType[echo.MessageReply]()
+var _ = am.MustRegisterGlobalType[echo.WhoElseEvent]()
+
+func main() {
+	conn, _ := am.NewClient().Connect("tcp://127.0.0.1:5560")
+	stream := conn.NewStream()
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			log.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *echo.MessageReply:
+			log.Printf("reply: %s", m.Msg)
+		case *echo.WhoElseEvent:
+			log.Printf("event: %s", m.Addr)
+		default:
+			log.Fatal(fmt.Errorf("unexpected %T", msg))
+		}
+	}
 }
 ```
 
 Notes:
 - Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).
-- Typed stream methods auto-register expected response types. For unsolicited messages, register types ahead of time with `RegisterTypes`.
+- Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
+- Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
 - Message names default to `am.<package-leaf>.<TypeName>`; implement `WireName() string` on a type if you need an override.
 - Example servers rely on build-tagged handlers; run them with `-tags server` (for example: `go run -tags server ./examples/hello/server`).

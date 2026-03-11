@@ -32,7 +32,7 @@ func (msg *MessageRequest) Handle(ctx *am.StreamContext) (am.Message, error) {
 	}, nil
 }
 
-var _ = am.MustRegisterGlobalMethod[MessageRequest]()
+var _ = am.MustRegisterGlobalType[MessageRequest]()
 
 func (msg *SubWhoElseEvent) Handle(ctx *am.StreamContext) (am.Message, error) {
 	mgr, err := statFromContext(ctx)
@@ -54,7 +54,7 @@ func (msg *SubWhoElseEvent) Handle(ctx *am.StreamContext) (am.Message, error) {
 	return nil, nil
 }
 
-var _ = am.MustRegisterGlobalMethod[SubWhoElseEvent]()
+var _ = am.MustRegisterGlobalType[SubWhoElseEvent]()
 
 func (msg *WhoElse) Handle(ctx *am.StreamContext) (am.Message, error) {
 	mgr, err := statFromContext(ctx)
@@ -64,14 +64,14 @@ func (msg *WhoElse) Handle(ctx *am.StreamContext) (am.Message, error) {
 	return &WhoElseReply{Clients: mgr.ListClients()}, nil
 }
 
-var _ = am.MustRegisterGlobalMethod[WhoElse]()
+var _ = am.MustRegisterGlobalType[WhoElse]()
 
 func (msg *MessageTimeout) Handle(_ *am.StreamContext) (am.Message, error) {
 	time.Sleep(time.Duration(msg.Secs) * time.Second)
 	return nil, nil
 }
 
-var _ = am.MustRegisterGlobalMethod[MessageTimeout]()
+var _ = am.MustRegisterGlobalType[MessageTimeout]()
 
 func statFromContext(ctx *am.StreamContext) (StatContext, error) {
 	mgr, ok := am.ContextAs[StatContext](ctx.Context())

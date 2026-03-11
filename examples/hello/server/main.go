@@ -5,7 +5,7 @@ import (
 	"log"
 
 	am "adaptivemsg"
-	_ "adaptivemsg/examples/hello/message"
+	_ "adaptivemsg/examples/hello"
 )
 
 func main() {

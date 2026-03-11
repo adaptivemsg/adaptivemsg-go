@@ -11,14 +11,14 @@ type Client struct {
 	timeout  time.Duration
 	codec    Codec
 	maxFrame uint32
-	registry *Registry
+	registry *registry
 }
 
 func NewClient() *Client {
 	return &Client{
 		codec:    CodecMap,
 		maxFrame: defaultMaxFrame,
-		registry: NewRegistry(),
+		registry: newRegistrySnapshot(),
 	}
 }
 
@@ -37,14 +37,9 @@ func (c *Client) WithMaxFrame(maxFrame uint32) *Client {
 	return c
 }
 
-func (c *Client) WithRegistry(registry *Registry) *Client {
-	c.registry = registry
-	return c
-}
-
 func (c *Client) Connect(addr string) (*Connection, error) {
 	if c.registry == nil {
-		c.registry = NewRegistry()
+		c.registry = newRegistrySnapshot()
 	}
 	network, address, err := parseAddr(addr)
 	if err != nil {
@@ -66,7 +61,7 @@ func (c *Client) Connect(addr string) (*Connection, error) {
 		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 	pending := newPendingConnection(conn, c.registry, nil, nil)
-	connection, err := pending.StartClient(c.codec, c.maxFrame)
+	connection, err := pending.startClient(c.codec, c.maxFrame)
 	if c.timeout > 0 {
 		_ = conn.SetDeadline(time.Time{})
 	}

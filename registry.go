@@ -7,11 +7,11 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-type HandlerFunc func(*StreamContext, Message) (Message, error)
+type handlerFunc func(*StreamContext, Message) (Message, error)
 
-type Registry struct {
+type registry struct {
 	mu       sync.RWMutex
-	handlers map[string]HandlerFunc
+	handlers map[string]handlerFunc
 	messages map[string]*messageFactory
 }
 
@@ -20,40 +20,30 @@ type messageFactory struct {
 	fields []int
 }
 
-func NewRegistry() *Registry {
-	reg := &Registry{
-		handlers: make(map[string]HandlerFunc),
+func newRegistry() *registry {
+	reg := &registry{
+		handlers: make(map[string]handlerFunc),
 		messages: make(map[string]*messageFactory),
 	}
-	_ = reg.RegisterMessage(&OkReply{})
-	_ = reg.RegisterMessage(&ErrorReply{})
+	_ = reg.registerMessage(&OkReply{})
+	_ = reg.registerMessage(&ErrorReply{})
 	return reg
 }
 
-var globalRegistry = newGlobalRegistry()
+var globalRegistry = newRegistry()
 
-func newGlobalRegistry() *Registry {
-	reg := &Registry{
-		handlers: make(map[string]HandlerFunc),
-		messages: make(map[string]*messageFactory),
-	}
-	_ = reg.RegisterMessage(&OkReply{})
-	_ = reg.RegisterMessage(&ErrorReply{})
-	return reg
-}
-
-func NewServerRegistry() *Registry {
+func newRegistrySnapshot() *registry {
 	return cloneRegistry(globalRegistry)
 }
 
-func cloneRegistry(src *Registry) *Registry {
+func cloneRegistry(src *registry) *registry {
 	if src == nil {
-		return NewRegistry()
+		return newRegistry()
 	}
 	src.mu.RLock()
 	defer src.mu.RUnlock()
-	reg := &Registry{
-		handlers: make(map[string]HandlerFunc, len(src.handlers)),
+	reg := &registry{
+		handlers: make(map[string]handlerFunc, len(src.handlers)),
 		messages: make(map[string]*messageFactory, len(src.messages)),
 	}
 	for wire, handler := range src.handlers {
@@ -67,7 +57,7 @@ func cloneRegistry(src *Registry) *Registry {
 	return reg
 }
 
-func (r *Registry) RegisterMessage(proto Message) error {
+func (r *registry) registerMessage(proto Message) error {
 	wire, factory, err := newMessageFactory(proto)
 	if err != nil {
 		return err
@@ -78,27 +68,27 @@ func (r *Registry) RegisterMessage(proto Message) error {
 	return nil
 }
 
-func (r *Registry) RegisterHandler(wire string, handler HandlerFunc) {
+func (r *registry) registerHandler(wire string, handler handlerFunc) {
 	r.mu.Lock()
 	r.handlers[wire] = handler
 	r.mu.Unlock()
 }
 
-func (r *Registry) Handler(wire string) (HandlerFunc, bool) {
+func (r *registry) handler(wire string) (handlerFunc, bool) {
 	r.mu.RLock()
 	h, ok := r.handlers[wire]
 	r.mu.RUnlock()
 	return h, ok
 }
 
-func (r *Registry) Message(wire string) (*messageFactory, bool) {
+func (r *registry) message(wire string) (*messageFactory, bool) {
 	r.mu.RLock()
 	factory, ok := r.messages[wire]
 	r.mu.RUnlock()
 	return factory, ok
 }
 
-func (r *Registry) HasHandlers() bool {
+func (r *registry) hasHandlers() bool {
 	r.mu.RLock()
 	count := len(r.handlers)
 	r.mu.RUnlock()
@@ -163,69 +153,7 @@ func messageTypeOf(proto Message) (reflect.Type, error) {
 	return t, nil
 }
 
-func RegisterTypes(r *Registry, protos ...Message) error {
-	if r == nil {
-		return ErrInvalidMessage{Reason: "registry must be non-nil"}
-	}
-	for _, proto := range protos {
-		if err := r.RegisterMessage(proto); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func EnsureRegistered[T any](r *Registry) error {
-	t := reflect.TypeOf((*T)(nil)).Elem()
-	return ensureRegisteredForReflectType(r, t)
-}
-
-func Handle[T any](r *Registry, handler func(*StreamContext, *T) (Message, error)) error {
-	if r == nil {
-		return ErrInvalidMessage{Reason: "registry must be non-nil"}
-	}
-	t := reflect.TypeOf((*T)(nil)).Elem()
-	if t.Kind() == reflect.Pointer {
-		return ErrInvalidMessage{Reason: "Handle expects a non-pointer type parameter"}
-	}
-	msg := new(T)
-	if err := r.RegisterMessage(msg); err != nil {
-		return err
-	}
-	wire, err := WireNameOf(msg)
-	if err != nil {
-		return err
-	}
-	r.RegisterHandler(wire, func(ctx *StreamContext, m Message) (Message, error) {
-		typed, ok := m.(*T)
-		if !ok {
-			return nil, ErrTypeMismatch{Expected: wire, Got: wireNameForValue(m)}
-		}
-		return handler(ctx, typed)
-	})
-	return nil
-}
-
-func RegisterGlobalMethods(protos ...Message) error {
-	return HandleMethods(globalRegistry, protos...)
-}
-
-func RegisterGlobalMethod[T any]() error {
-	msg, err := newMessageForType[T]()
-	if err != nil {
-		return err
-	}
-	return RegisterGlobalMethods(msg)
-}
-
-func MustRegisterGlobalMethod[T any]() struct{} {
-	if err := RegisterGlobalMethod[T](); err != nil {
-		panic(err)
-	}
-	return struct{}{}
-}
-
-func HandleMethods(r *Registry, protos ...Message) error {
+func registerTypes(r *registry, protos ...Message) error {
 	if r == nil {
 		return ErrInvalidMessage{Reason: "registry must be non-nil"}
 	}
@@ -233,36 +161,33 @@ func HandleMethods(r *Registry, protos ...Message) error {
 		Handle(*StreamContext) (Message, error)
 	})(nil)).Elem()
 	for _, proto := range protos {
-		if proto == nil {
-			return ErrInvalidMessage{Reason: "message must be non-nil"}
+		if err := r.registerMessage(proto); err != nil {
+			return err
 		}
 		protoVal := reflect.ValueOf(proto)
 		if protoVal.Kind() == reflect.Pointer && protoVal.IsNil() {
 			protoVal = reflect.New(protoVal.Type().Elem())
 		}
-		if !protoVal.Type().Implements(handleType) {
-			if protoVal.Kind() == reflect.Struct {
-				ptrVal := reflect.New(protoVal.Type())
-				ptrVal.Elem().Set(protoVal)
+		handlerVal := protoVal
+		if !handlerVal.Type().Implements(handleType) {
+			if handlerVal.Kind() == reflect.Struct {
+				ptrVal := reflect.New(handlerVal.Type())
+				ptrVal.Elem().Set(handlerVal)
 				if ptrVal.Type().Implements(handleType) {
-					protoVal = ptrVal
+					handlerVal = ptrVal
 				} else {
-					return ErrInvalidMessage{Reason: "message must implement Handle(*StreamContext) (Message, error)"}
+					continue
 				}
 			} else {
-				return ErrInvalidMessage{Reason: "message must implement Handle(*StreamContext) (Message, error)"}
+				continue
 			}
 		}
-		protoMsg := protoVal.Interface()
-		if err := r.RegisterMessage(protoMsg); err != nil {
-			return err
-		}
-		wire, err := WireNameOf(protoMsg)
+		wire, err := WireNameOf(handlerVal.Interface())
 		if err != nil {
 			return err
 		}
 		wireName := wire
-		r.RegisterHandler(wireName, func(ctx *StreamContext, m Message) (Message, error) {
+		r.registerHandler(wireName, func(ctx *StreamContext, m Message) (Message, error) {
 			handler, ok := m.(interface {
 				Handle(*StreamContext) (Message, error)
 			})
@@ -273,6 +198,25 @@ func HandleMethods(r *Registry, protos ...Message) error {
 		})
 	}
 	return nil
+}
+
+func RegisterGlobalTypes(protos ...Message) error {
+	return registerTypes(globalRegistry, protos...)
+}
+
+func RegisterGlobalType[T any]() error {
+	msg, err := newMessageForType[T]()
+	if err != nil {
+		return err
+	}
+	return RegisterGlobalTypes(msg)
+}
+
+func MustRegisterGlobalType[T any]() struct{} {
+	if err := RegisterGlobalType[T](); err != nil {
+		panic(err)
+	}
+	return struct{}{}
 }
 
 func (f *messageFactory) decodeMap(raw msgpack.RawMessage) (Message, error) {

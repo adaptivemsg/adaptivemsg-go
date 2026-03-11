@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	am "adaptivemsg"
-	"adaptivemsg/examples/hello/message"
+	"adaptivemsg/examples/hello"
 )
 
 func main() {
@@ -28,7 +28,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		reply, err := am.SendRecvAs[*message.HelloReply](conn, &message.HelloRequest{
+		reply, err := am.SendRecvAs[*hello.HelloReply](conn, &hello.HelloRequest{
 			Who:      "John",
 			Question: "who are you",
 		})
@@ -36,12 +36,12 @@ func main() {
 			log.Printf("default stream error: %v", err)
 			return
 		}
-		log.Printf("default stream: %s", reply.Answer)
+		log.Printf("default stream: %s (trace %s)", reply.Answer, reply.Internal.TraceID)
 	}()
 
 	go func() {
 		defer wg.Done()
-		reply, err := am.SendRecvAs[*message.HelloReply](streamA, &message.HelloRequest{
+		reply, err := am.SendRecvAs[*hello.HelloReply](streamA, &hello.HelloRequest{
 			Who:      "Alice",
 			Question: "how are you",
 		})
@@ -49,12 +49,12 @@ func main() {
 			log.Printf("stream A error: %v", err)
 			return
 		}
-		log.Printf("stream A: %s", reply.Answer)
+		log.Printf("stream A: %s (trace %s)", reply.Answer, reply.Internal.TraceID)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, err := am.SendRecvAs[*message.HelloReply](streamB, &message.HelloRequest{
+		_, err := am.SendRecvAs[*hello.HelloReply](streamB, &hello.HelloRequest{
 			Who:      "Bob",
 			Question: "error please",
 		})

@@ -14,7 +14,7 @@ func (n Netconn) PeerAddr() string {
 }
 
 type Server struct {
-	registry      *Registry
+	registry      *registry
 	onConnect     func(Netconn) error
 	onDisconnect  func(Netconn) error
 	onNewStream   func(*Context)
@@ -23,17 +23,8 @@ type Server struct {
 
 func NewServer() *Server {
 	return &Server{
-		registry: NewServerRegistry(),
+		registry: newRegistrySnapshot(),
 	}
-}
-
-func (s *Server) WithRegistry(registry *Registry) *Server {
-	s.registry = registry
-	return s
-}
-
-func (s *Server) Registry() *Registry {
-	return s.registry
 }
 
 func (s *Server) OnConnect(f func(Netconn) error) *Server {
@@ -98,6 +89,9 @@ func (s *Server) serveWithAccept(accept func() (net.Conn, string, error)) error 
 }
 
 func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
+	if s.registry == nil {
+		s.registry = newRegistrySnapshot()
+	}
 	pending := newPendingConnection(conn, s.registry, s.onNewStream, s.onCloseStream)
 	if s.onConnect != nil {
 		if err := s.onConnect(netconn); err != nil {
@@ -105,7 +99,7 @@ func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
 			return
 		}
 	}
-	connection, err := pending.StartServer(defaultMaxFrame)
+	connection, err := pending.startServer(defaultMaxFrame)
 	if err != nil {
 		_ = conn.Close()
 		return

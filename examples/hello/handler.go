@@ -1,6 +1,6 @@
 //go:build server
 
-package message
+package hello
 
 import (
 	"fmt"
@@ -21,7 +21,12 @@ func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {
 	case strings.Contains(question, "how are you"):
 		answer = "I am good"
 	}
-	return &HelloReply{Answer: fmt.Sprintf("%s, %s", answer, msg.Who)}, nil
+	return &HelloReply{
+		Answer: fmt.Sprintf("%s, %s", answer, msg.Who),
+		Internal: HelloInternal{
+			TraceID: fmt.Sprintf("trace-%s", msg.Who),
+		},
+	}, nil
 }
 
-var _ = am.MustRegisterGlobalMethod[HelloRequest]()
+var _ = am.MustRegisterGlobalType[HelloRequest]()

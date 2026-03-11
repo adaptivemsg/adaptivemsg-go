@@ -2,6 +2,7 @@ package adaptivemsg
 
 import (
 	"reflect"
+	"sync"
 	"time"
 
 	"sync/atomic"
@@ -10,10 +11,14 @@ import (
 type streamCore struct {
 	id               uint32
 	connection       *Connection
-	inbox            chan Message
+	inbox            chan rawMessage
+	incoming         chan []byte
 	handlerCh        chan handlerJob
 	recvTimeoutNanos atomic.Int64
 	recvActive       atomic.Bool
+	peeked           rawMessage
+	hasPeeked        bool
+	closeOnce        sync.Once
 }
 
 type Stream[T any] struct {
@@ -70,40 +75,69 @@ func (s *Stream[T]) Send(msg Message) error {
 	return s.core.sendBoxed(msg)
 }
 
-func (s *Stream[T]) SendRecvAny(msg Message) (Message, error) {
-	return s.core.sendRecvAny(msg)
-}
-
 func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	var zero T
-	if err := ensureRegisteredForType[T](s.core.connection.registry); err != nil {
+	if err := s.core.sendBoxed(msg); err != nil {
 		return zero, err
 	}
-	reply, err := s.SendRecvAny(msg)
+	raw, err := s.core.recvRaw()
 	if err != nil {
 		return zero, err
 	}
-	typed, ok := reply.(T)
-	if !ok {
-		return zero, ErrTypeMismatch{Expected: expectedWireName[T](), Got: wireNameForValue(reply)}
+	if raw.Wire == errorReplyWireName {
+		reply, err := decodeRawAs[*ErrorReply](raw)
+		if err != nil {
+			s.core.protocolError("codec_error", err.Error())
+			return zero, err
+		}
+		return zero, ErrRemote{Code: reply.Code, Message: reply.Message}
+	}
+	if isInterfaceType[T]() {
+		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
+		if err != nil {
+			return zero, err
+		}
+		typed, ok := decoded.(T)
+		if !ok {
+			return zero, ErrTypeMismatch{Expected: expectedWireName[T](), Got: wireNameForValue(decoded)}
+		}
+		return typed, nil
+	}
+	typed, err := decodeRawAs[T](raw)
+	if err != nil {
+		s.core.protocolErrorFor(err)
+		return zero, err
 	}
 	return typed, nil
 }
 
 func (s *Stream[T]) Recv() (T, error) {
 	var zero T
-	if err := ensureRegisteredForType[T](s.core.connection.registry); err != nil {
-		return zero, err
-	}
-	msg, err := s.core.recvMsg()
+	raw, err := s.core.recvRaw()
 	if err != nil {
 		return zero, err
 	}
-	typed, ok := msg.(T)
-	if !ok {
-		return zero, ErrTypeMismatch{Expected: expectedWireName[T](), Got: wireNameForValue(msg)}
+	if isInterfaceType[T]() {
+		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
+		if err != nil {
+			return zero, err
+		}
+		typed, ok := decoded.(T)
+		if !ok {
+			return zero, ErrTypeMismatch{Expected: expectedWireName[T](), Got: wireNameForValue(decoded)}
+		}
+		return typed, nil
+	}
+	typed, err := decodeRawAs[T](raw)
+	if err != nil {
+		s.core.protocolErrorFor(err)
+		return zero, err
 	}
 	return typed, nil
+}
+
+func (s *Stream[T]) PeekWire() (string, error) {
+	return s.core.peekWire()
 }
 
 func (s *streamCore) setRecvTimeout(timeout time.Duration) {
@@ -112,20 +146,6 @@ func (s *streamCore) setRecvTimeout(timeout time.Duration) {
 		return
 	}
 	s.recvTimeoutNanos.Store(timeout.Nanoseconds())
-}
-
-func (s *streamCore) sendRecvAny(msg Message) (Message, error) {
-	if err := s.sendBoxed(msg); err != nil {
-		return nil, err
-	}
-	reply, err := s.recvMsg()
-	if err != nil {
-		return nil, err
-	}
-	if errReply, ok := reply.(*ErrorReply); ok {
-		return nil, ErrRemote{Code: errReply.Code, Message: errReply.Message}
-	}
-	return reply, nil
 }
 
 func (s *streamCore) recvGuard() (func(), error) {
@@ -137,22 +157,57 @@ func (s *streamCore) recvGuard() (func(), error) {
 	}, nil
 }
 
-func (s *streamCore) recvMsg() (Message, error) {
+func (s *streamCore) recvRaw() (rawMessage, error) {
 	release, err := s.recvGuard()
 	if err != nil {
-		return nil, err
+		return rawMessage{}, err
 	}
 	defer release()
+	if s.hasPeeked {
+		msg := s.peeked
+		s.hasPeeked = false
+		return msg, nil
+	}
+	return s.readRaw()
+}
+
+func (s *streamCore) peekWire() (string, error) {
+	msg, err := s.peekRaw()
+	if err != nil {
+		return "", err
+	}
+	return msg.Wire, nil
+}
+
+func (s *streamCore) peekRaw() (rawMessage, error) {
+	release, err := s.recvGuard()
+	if err != nil {
+		return rawMessage{}, err
+	}
+	defer release()
+	if s.hasPeeked {
+		return s.peeked, nil
+	}
+	msg, err := s.readRaw()
+	if err != nil {
+		return rawMessage{}, err
+	}
+	s.peeked = msg
+	s.hasPeeked = true
+	return msg, nil
+}
+
+func (s *streamCore) readRaw() (rawMessage, error) {
 	timeoutNanos := s.recvTimeoutNanos.Load()
 	if timeoutNanos == 0 {
 		select {
 		case msg, ok := <-s.inbox:
 			if !ok {
-				return nil, ErrClosed{}
+				return rawMessage{}, ErrClosed{}
 			}
 			return msg, nil
 		case <-s.connection.closeCh:
-			return nil, ErrClosed{}
+			return rawMessage{}, ErrClosed{}
 		}
 	}
 	timer := time.NewTimer(time.Duration(timeoutNanos))
@@ -160,13 +215,13 @@ func (s *streamCore) recvMsg() (Message, error) {
 	select {
 	case msg, ok := <-s.inbox:
 		if !ok {
-			return nil, ErrClosed{}
+			return rawMessage{}, ErrClosed{}
 		}
 		return msg, nil
 	case <-s.connection.closeCh:
-		return nil, ErrClosed{}
+		return rawMessage{}, ErrClosed{}
 	case <-timer.C:
-		return nil, ErrRecvTimeout{}
+		return rawMessage{}, ErrRecvTimeout{}
 	}
 }
 
@@ -179,7 +234,12 @@ func (s *streamCore) sendBoxed(msg Message) error {
 	return s.connection.enqueueFrame(frame)
 }
 
-func (s *streamCore) inboxQ(msg Message) error {
+func (s *streamCore) inboxQ(msg rawMessage) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = ErrClosed{}
+		}
+	}()
 	select {
 	case s.inbox <- msg:
 		return nil
@@ -188,10 +248,32 @@ func (s *streamCore) inboxQ(msg Message) error {
 	}
 }
 
-func (s *streamCore) handlerQ(job handlerJob) error {
+func (s *streamCore) incomingQ(payload []byte) (err error) {
+	if s.incoming == nil {
+		return ErrClosed{}
+	}
+	defer func() {
+		if recover() != nil {
+			err = ErrClosed{}
+		}
+	}()
+	select {
+	case s.incoming <- payload:
+		return nil
+	case <-s.connection.closeCh:
+		return ErrClosed{}
+	}
+}
+
+func (s *streamCore) handlerQ(job handlerJob) (err error) {
 	if s.handlerCh == nil {
 		return ErrClosed{}
 	}
+	defer func() {
+		if recover() != nil {
+			err = ErrClosed{}
+		}
+	}()
 	select {
 	case s.handlerCh <- job:
 		return nil
@@ -200,12 +282,35 @@ func (s *streamCore) handlerQ(job handlerJob) error {
 	}
 }
 
-func ensureRegisteredForType[T any](r *Registry) error {
-	t := reflect.TypeOf((*T)(nil)).Elem()
-	if t.Kind() == reflect.Interface {
-		return nil
+func (s *streamCore) close() {
+	s.closeOnce.Do(func() {
+		close(s.inbox)
+		if s.incoming != nil {
+			close(s.incoming)
+		}
+		if s.handlerCh != nil {
+			close(s.handlerCh)
+		}
+	})
+}
+
+func (s *streamCore) protocolError(code, message string) {
+	if code == "" {
+		code = "protocol_error"
 	}
-	return ensureRegisteredForReflectType(r, t)
+	_ = s.sendBoxed(NewErrorReply(code, message))
+	s.connection.removeStream(s.id)
+}
+
+func (s *streamCore) protocolErrorFor(err error) {
+	if err == nil {
+		return
+	}
+	if mismatch, ok := err.(ErrTypeMismatch); ok {
+		s.protocolError("protocol_error", "expected "+mismatch.Expected+" got "+mismatch.Got)
+		return
+	}
+	s.protocolError("codec_error", err.Error())
 }
 
 func expectedWireName[T any]() string {
@@ -219,3 +324,10 @@ func expectedWireName[T any]() string {
 	}
 	return t.String()
 }
+
+func isInterfaceType[T any]() bool {
+	t := reflect.TypeOf((*T)(nil)).Elem()
+	return t.Kind() == reflect.Interface
+}
+
+var errorReplyWireName = expectedWireName[*ErrorReply]()
