@@ -94,6 +94,53 @@ func main() {
 }
 ```
 
+## API reference (surface)
+
+Functions:
+- `SendRecvAs`, `StreamAs`, `WireNameOf`, `DefaultWireName`, `ContextAs`
+- `RegisterGlobalType(s)`, `MustRegisterGlobalType`
+
+Client:
+- `NewClient`
+- `Client.WithTimeout`, `Client.WithCodec`, `Client.WithMaxFrame`, `Client.Connect`
+
+Server:
+- `NewServer`
+- `Server.Serve`, `Server.OnConnect`, `Server.OnDisconnect`, `Server.OnNewStream`, `Server.OnCloseStream`
+- `Netconn.PeerAddr`
+
+Connection (default stream view):
+- `Connection.NewStream`, `Connection.Close`, `Connection.WaitClosed`
+- `Connection.Send`, `Connection.SendRecv`, `Connection.Recv`, `Connection.PeekWire`, `Connection.SetRecvTimeout`
+
+Stream:
+- `Stream[T].Send`, `Stream[T].SendRecv`, `Stream[T].Recv`, `Stream[T].PeekWire`, `Stream[T].SetRecvTimeout`, `Stream[T].ID`, `Stream[T].Close`
+
+Context:
+- `StreamContext.SetContext`, `StreamContext.GetContext`, `StreamContext.NewTask`
+
+Codec & messages:
+- `CodecMap`, `CodecCompact`, `Codec.String`
+- `Message`, `NamedMessage`, `OkReply`, `ErrorReply`, `NewErrorReply`
+
+## Error reasoning
+
+Local input/usage errors:
+- `ErrInvalidMessage`: nil or non-struct messages, invalid wire names, compact field issues.
+- `ErrUnknownMessage`: wire name not registered in the registry.
+
+Protocol/compat errors:
+- `ErrUnsupportedCodec`, `ErrUnsupportedFrameVersion`, `ErrNoCommonVersion`, `ErrBadHandshakeMagic`,
+  `ErrHandshakeRejected`, `ErrFrameTooLarge`, `ErrUnsupportedTransport`.
+
+Runtime errors:
+- `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`.
+
+Remote errors:
+- `ErrorReply` is sent by the peer; `SendRecv` surfaces it as `ErrRemote{Code, Message}`.
+- `protocol_error` = wire mismatch or invalid ordering; `codec_error` = decode/envelope failure;
+  `handler_error` = handler returned an error.
+
 Notes:
 - Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).
 - Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
