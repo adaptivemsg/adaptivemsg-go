@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "tcp://127.0.0.1:5555", "server address")
+	addr := flag.String("addr", "tcp://127.0.0.1:5555", "server address (examples: tcp://127.0.0.1:5555, uds://@adaptivemsg-hello, uds:///tmp/adaptivemsg-hello.sock)")
 	flag.Parse()
 
 	client := am.NewClient()

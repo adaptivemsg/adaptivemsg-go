@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "tcp://127.0.0.1:5560", "listen address")
+	addr := flag.String("addr", "tcp://127.0.0.1:5560", "listen address (examples: tcp://127.0.0.1:5560, uds://@adaptivemsg-echo, uds:///tmp/adaptivemsg-echo.sock)")
 	flag.Parse()
 
 	mgr := echo.NewStatMgr()

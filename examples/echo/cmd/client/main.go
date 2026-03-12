@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "tcp://127.0.0.1:5560", "server address")
+	addr := flag.String("addr", "tcp://127.0.0.1:5560", "server address (examples: tcp://127.0.0.1:5560, uds://@adaptivemsg-echo, uds:///tmp/adaptivemsg-echo.sock)")
 	cmd := flag.String("cmd", "echo", "echo (default), timeout, whoelse, or whoelse_sub")
 	flag.Parse()
 
