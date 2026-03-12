@@ -6,13 +6,17 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// Codec selects the payload encoding format.
 type Codec uint8
 
 const (
+	// CodecCompact encodes messages as a compact array envelope.
 	CodecCompact Codec = 1
+	// CodecMap encodes messages as a map envelope.
 	CodecMap     Codec = 2
 )
 
+// String returns the human-readable codec name.
 func (c Codec) String() string {
 	switch c {
 	case CodecCompact:

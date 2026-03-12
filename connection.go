@@ -38,6 +38,7 @@ type handlerJob struct {
 	msg     Message
 }
 
+// Connection is a live session and also acts as the default stream.
 type Connection struct {
 	conn              net.Conn
 	registry          *registry
@@ -101,30 +102,37 @@ func (c *Connection) start() {
 	go c.readerLoop()
 }
 
+// Close shuts down the connection and all streams.
 func (c *Connection) Close() {
 	c.markClosed()
 }
 
+// WaitClosed blocks until the connection closes.
 func (c *Connection) WaitClosed() {
 	<-c.closeCh
 }
 
+// Send writes a message on the default stream.
 func (c *Connection) Send(msg Message) error {
 	return c.defaultStream().Send(msg)
 }
 
+// SendRecv sends a message and waits for the reply on the default stream.
 func (c *Connection) SendRecv(msg Message) (Message, error) {
 	return c.defaultStream().SendRecv(msg)
 }
 
+// Recv reads the next message from the default stream.
 func (c *Connection) Recv() (Message, error) {
 	return c.defaultStream().Recv()
 }
 
+// PeekWire returns the next wire name on the default stream without decoding.
 func (c *Connection) PeekWire() (string, error) {
 	return c.defaultStream().PeekWire()
 }
 
+// SetRecvTimeout sets the default stream receive timeout.
 func (c *Connection) SetRecvTimeout(timeout time.Duration) {
 	c.defaultStream().SetRecvTimeout(timeout)
 }
@@ -141,6 +149,7 @@ func (c *Connection) streamForID(streamID uint32) *streamCore {
 	return streamCtx.stream.core
 }
 
+// NewStream allocates a new stream ID and returns a Stream view.
 func (c *Connection) NewStream() *Stream[Message] {
 	streamID := c.nextStreamID.Add(1)
 	return &Stream[Message]{core: c.streamForID(streamID)}
@@ -330,41 +339,6 @@ func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
 	default:
 		return nil, ErrUnsupportedCodec{Value: c.config.codec.toByte()}
 	}
-}
-
-func (c *Connection) decodeMessage(payload []byte) (Message, error) {
-	switch c.config.codec {
-	case CodecCompact:
-		return c.decodeCompact(payload)
-	case CodecMap:
-		return c.decodeMap(payload)
-	default:
-		return nil, ErrUnsupportedCodec{Value: c.config.codec.toByte()}
-	}
-}
-
-func (c *Connection) decodeMap(payload []byte) (Message, error) {
-	wire, data, err := decodeMapEnvelope(payload)
-	if err != nil {
-		return nil, err
-	}
-	factory, ok := c.registry.message(wire)
-	if !ok {
-		return nil, ErrUnknownMessage{Name: wire}
-	}
-	return factory.decodeMap(data)
-}
-
-func (c *Connection) decodeCompact(payload []byte) (Message, error) {
-	wire, values, err := decodeCompactEnvelope(payload)
-	if err != nil {
-		return nil, err
-	}
-	factory, ok := c.registry.message(wire)
-	if !ok {
-		return nil, ErrUnknownMessage{Name: wire}
-	}
-	return factory.decodeCompact(values)
 }
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {

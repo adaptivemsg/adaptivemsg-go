@@ -21,6 +21,7 @@ type streamCore struct {
 	closeOnce        sync.Once
 }
 
+// Stream is a typed view over a single stream ID.
 type Stream[T any] struct {
 	core *streamCore
 }
@@ -29,6 +30,7 @@ type viewCoreProvider interface {
 	viewCore() *streamCore
 }
 
+// StreamAs returns a typed Stream view for a stream provider.
 func StreamAs[T any](v viewCoreProvider) *Stream[T] {
 	if v == nil {
 		return nil
@@ -43,6 +45,7 @@ func StreamAs[T any](v viewCoreProvider) *Stream[T] {
 	return &Stream[T]{core: core}
 }
 
+// SendRecvAs sends a message and receives a typed reply on a stream provider.
 func SendRecvAs[T any](v viewCoreProvider, msg Message) (T, error) {
 	var zero T
 	stream := StreamAs[T](v)
@@ -59,22 +62,27 @@ func (s *Stream[T]) viewCore() *streamCore {
 	return s.core
 }
 
+// ID returns the stream ID.
 func (s *Stream[T]) ID() uint32 {
 	return s.core.id
 }
 
+// Close removes the stream from its connection.
 func (s *Stream[T]) Close() {
 	s.core.connection.removeStream(s.core.id)
 }
 
+// SetRecvTimeout sets the receive timeout for this stream.
 func (s *Stream[T]) SetRecvTimeout(timeout time.Duration) {
 	s.core.setRecvTimeout(timeout)
 }
 
+// Send encodes and writes a message on this stream.
 func (s *Stream[T]) Send(msg Message) error {
 	return s.core.sendBoxed(msg)
 }
 
+// SendRecv sends a message and waits for a typed reply.
 func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	var zero T
 	if err := s.core.sendBoxed(msg); err != nil {
@@ -111,6 +119,7 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	return typed, nil
 }
 
+// Recv reads and decodes the next message from this stream.
 func (s *Stream[T]) Recv() (T, error) {
 	var zero T
 	raw, err := s.core.recvRaw()
@@ -136,6 +145,7 @@ func (s *Stream[T]) Recv() (T, error) {
 	return typed, nil
 }
 
+// PeekWire returns the next wire name without decoding.
 func (s *Stream[T]) PeekWire() (string, error) {
 	return s.core.peekWire()
 }

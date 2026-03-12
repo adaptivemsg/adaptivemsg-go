@@ -5,18 +5,22 @@ import (
 	"strings"
 )
 
+// Message is the marker interface for payload types.
 type Message interface{}
 
+// NamedMessage overrides the default wire name for a message.
 type NamedMessage interface {
 	WireName() string
 }
 
+// OkReply is the default acknowledgement for handlers.
 type OkReply struct{}
 
 func (*OkReply) WireName() string {
 	return "am.message.OkReply"
 }
 
+// ErrorReply is the standard error payload sent over the wire.
 type ErrorReply struct {
 	Code    string `msgpack:"code"`
 	Message string `msgpack:"message"`
@@ -26,10 +30,12 @@ func (*ErrorReply) WireName() string {
 	return "am.message.ErrorReply"
 }
 
+// NewErrorReply builds an ErrorReply with the given code and message.
 func NewErrorReply(code, message string) *ErrorReply {
 	return &ErrorReply{Code: code, Message: message}
 }
 
+// WireNameOf returns the wire name for a message value.
 func WireNameOf(msg Message) (string, error) {
 	if msg == nil {
 		return "", ErrInvalidMessage{Reason: "message must be non-nil"}
@@ -53,11 +59,6 @@ func WireNameOf(msg Message) (string, error) {
 		}
 	}
 	return defaultWireNameForValue("am", msg)
-}
-
-func DefaultWireName(ns string, msg Message) string {
-	name, _ := defaultWireNameForValue(ns, msg)
-	return name
 }
 
 func defaultWireNameForValue(ns string, msg Message) (string, error) {

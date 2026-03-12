@@ -200,18 +200,20 @@ func registerTypes(r *registry, protos ...Message) error {
 	return nil
 }
 
-func RegisterGlobalTypes(protos ...Message) error {
+func registerGlobalTypes(protos ...Message) error {
 	return registerTypes(globalRegistry, protos...)
 }
 
+// RegisterGlobalType registers a message type (and its handler, if implemented) globally.
 func RegisterGlobalType[T any]() error {
 	msg, err := newMessageForType[T]()
 	if err != nil {
 		return err
 	}
-	return RegisterGlobalTypes(msg)
+	return registerGlobalTypes(msg)
 }
 
+// MustRegisterGlobalType registers a type globally and panics on failure.
 func MustRegisterGlobalType[T any]() struct{} {
 	if err := RegisterGlobalType[T](); err != nil {
 		panic(err)

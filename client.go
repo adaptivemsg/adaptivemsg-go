@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// Client configures outbound connections.
 type Client struct {
 	timeout  time.Duration
 	codec    Codec
@@ -14,6 +15,7 @@ type Client struct {
 	registry *registry
 }
 
+// NewClient returns a client with default settings.
 func NewClient() *Client {
 	return &Client{
 		codec:    CodecMap,
@@ -22,21 +24,25 @@ func NewClient() *Client {
 	}
 }
 
+// WithTimeout sets the dial timeout and returns the client.
 func (c *Client) WithTimeout(timeout time.Duration) *Client {
 	c.timeout = timeout
 	return c
 }
 
+// WithCodec sets the codec used for new connections.
 func (c *Client) WithCodec(codec Codec) *Client {
 	c.codec = codec
 	return c
 }
 
+// WithMaxFrame sets the maximum frame size advertised to the peer.
 func (c *Client) WithMaxFrame(maxFrame uint32) *Client {
 	c.maxFrame = maxFrame
 	return c
 }
 
+// Connect dials the address and returns a live Connection.
 func (c *Client) Connect(addr string) (*Connection, error) {
 	if c.registry == nil {
 		c.registry = newRegistrySnapshot()

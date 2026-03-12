@@ -97,8 +97,8 @@ func main() {
 ## API reference (surface)
 
 Functions:
-- `SendRecvAs`, `StreamAs`, `WireNameOf`, `DefaultWireName`, `ContextAs`
-- `RegisterGlobalType(s)`, `MustRegisterGlobalType`
+- `SendRecvAs`, `StreamAs`, `WireNameOf`, `ContextAs`
+- `RegisterGlobalType`, `MustRegisterGlobalType`
 
 Client:
 - `NewClient`
