@@ -7,6 +7,12 @@ import (
 
 type handlerFunc func(*StreamContext, Message) (Message, error)
 
+type handler interface {
+	Handle(*StreamContext) (Message, error)
+}
+
+var handlerType = reflect.TypeOf((*handler)(nil)).Elem()
+
 type registry struct {
 	mu       sync.RWMutex
 	handlers map[string]handlerFunc
@@ -18,8 +24,8 @@ func newRegistry() *registry {
 		handlers: make(map[string]handlerFunc),
 		messages: make(map[string]reflect.Type),
 	}
-	_ = reg.registerMessage(&OkReply{})
-	_ = reg.registerMessage(&ErrorReply{})
+	_, _, _ = reg.registerMessage(&OkReply{})
+	_, _, _ = reg.registerMessage(&ErrorReply{})
 	return reg
 }
 
@@ -48,19 +54,19 @@ func cloneRegistry(src *registry) *registry {
 	return reg
 }
 
-func (r *registry) registerMessage(proto Message) error {
+func (r *registry) registerMessage(proto Message) (string, reflect.Type, error) {
 	t, err := messageTypeOf(proto)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	wire, err := WireNameOf(proto)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	r.mu.Lock()
 	r.messages[wire] = t
 	r.mu.Unlock()
-	return nil
+	return wire, t, nil
 }
 
 func (r *registry) registerHandler(wire string, handler handlerFunc) {
@@ -136,47 +142,33 @@ func registerTypes(r *registry, protos ...Message) error {
 	if r == nil {
 		return ErrInvalidMessage{Reason: "registry must be non-nil"}
 	}
-	handleType := reflect.TypeOf((*interface {
-		Handle(*StreamContext) (Message, error)
-	})(nil)).Elem()
 	for _, proto := range protos {
-		if err := r.registerMessage(proto); err != nil {
-			return err
-		}
-		protoVal := reflect.ValueOf(proto)
-		if protoVal.Kind() == reflect.Pointer && protoVal.IsNil() {
-			protoVal = reflect.New(protoVal.Type().Elem())
-		}
-		handlerVal := protoVal
-		if !handlerVal.Type().Implements(handleType) {
-			if handlerVal.Kind() == reflect.Struct {
-				ptrVal := reflect.New(handlerVal.Type())
-				ptrVal.Elem().Set(handlerVal)
-				if ptrVal.Type().Implements(handleType) {
-					handlerVal = ptrVal
-				} else {
-					continue
-				}
-			} else {
-				continue
-			}
-		}
-		wire, err := WireNameOf(handlerVal.Interface())
+		wire, typ, err := r.registerMessage(proto)
 		if err != nil {
 			return err
 		}
-		wireName := wire
-		r.registerHandler(wireName, func(ctx *StreamContext, m Message) (Message, error) {
-			handler, ok := m.(interface {
-				Handle(*StreamContext) (Message, error)
-			})
-			if !ok {
-				return nil, ErrTypeMismatch{Expected: wireName, Got: wireNameForValue(m)}
-			}
-			return handler.Handle(ctx)
-		})
+		if handler := handlerForType(typ, wire); handler != nil {
+			r.registerHandler(wire, handler)
+		}
 	}
 	return nil
+}
+
+func handlerForType(t reflect.Type, wire string) handlerFunc {
+	if t == nil {
+		return nil
+	}
+	if !reflect.PointerTo(t).Implements(handlerType) {
+		return nil
+	}
+	wireName := wire
+	return func(ctx *StreamContext, m Message) (Message, error) {
+		handler, ok := m.(handler)
+		if !ok {
+			return nil, ErrTypeMismatch{Expected: wireName, Got: wireNameForValue(m)}
+		}
+		return handler.Handle(ctx)
+	}
 }
 
 func registerGlobalTypes(protos ...Message) error {

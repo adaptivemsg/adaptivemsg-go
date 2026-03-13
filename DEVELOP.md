@@ -74,7 +74,8 @@ Handler loop (per stream, if handlers exist):
 
 Recv path:
 - `Recv[T]` pulls from the raw inbox, verifies wire name, decodes on demand.
-- `Recv` on `Stream[Message]` uses registry to decode to a concrete type.
+- `Recv` on `Stream[Message]` uses the registry to decode to a concrete type;
+  unregistered wires return `ErrUnknownMessage` without emitting a protocol error.
 - `PeekWire()` peeks the next wire without decoding (respects timeout/recv guard).
 
 Send path:
@@ -87,8 +88,8 @@ The inbox stores raw envelopes so decoding can happen in the consumer goroutine.
 Handlers are checked by wire name first; if a handler exists, decoding happens
 in the handler path; otherwise the raw envelope is queued for `Recv`.
 
-`Recv[T]` does strict wire matching; on mismatch it sends an `ErrorReply` with
-`protocol_error` and closes the stream.
+`Recv[T]` for concrete types does strict wire matching; on mismatch it sends an
+`ErrorReply` with `protocol_error` and closes the stream.
 
 ## Errors & Protocol Signaling
 
@@ -128,8 +129,12 @@ Protocol error codes:
 ## Code Pointers
 
 - `connection.go`: handshake, frames, stream lifecycle, reader/writer loops.
+- `protocol.go`: handshake format and negotiation.
+- `frame.go`: frame header IO.
 - `stream.go`: send/recv, timeouts, inbox handling, protocol errors.
-- `codec.go`: map/compact envelopes and encoding.
+- `codec.go`: codec interfaces and envelopes.
+- `codec_registry.go`: codec registration and lookup.
+- `codec_msgpack.go`: map/compact MessagePack codecs.
 - `registry.go`: wire registry and handler registration.
 - `message.go`: wire name derivation and built-in message types.
 - `context.go`: per-stream context storage and handler task gating.

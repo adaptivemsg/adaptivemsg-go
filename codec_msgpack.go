@@ -6,6 +6,13 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+const (
+	// CodecMsgpackCompact encodes messages as a MessagePack compact array envelope.
+	CodecMsgpackCompact CodecID = 1
+	// CodecMsgpackMap encodes messages as a MessagePack map envelope.
+	CodecMsgpackMap CodecID = 2
+)
+
 type msgpackMapCodec struct{}
 
 func init() {
