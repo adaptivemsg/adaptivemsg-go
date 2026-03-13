@@ -1,145 +1,83 @@
 package adaptivemsg
 
-import (
-	"reflect"
+import "sync"
 
-	"github.com/vmihailenco/msgpack/v5"
-)
-
-// Codec selects the payload encoding format.
-type Codec uint8
+// CodecID identifies a payload encoding format.
+type CodecID byte
 
 const (
-	// CodecCompact encodes messages as a compact array envelope.
-	CodecCompact Codec = 1
-	// CodecMap encodes messages as a map envelope.
-	CodecMap     Codec = 2
+	// CodecMsgpackCompact encodes messages as a MessagePack compact array envelope.
+	CodecMsgpackCompact CodecID = 1
+	// CodecMsgpackMap encodes messages as a MessagePack map envelope.
+	CodecMsgpackMap CodecID = 2
 )
 
 // String returns the human-readable codec name.
-func (c Codec) String() string {
+func (c CodecID) String() string {
 	switch c {
-	case CodecCompact:
+	case CodecMsgpackCompact:
 		return "compact"
-	case CodecMap:
+	case CodecMsgpackMap:
 		return "map"
 	default:
 		return "unknown"
 	}
 }
 
-func (c Codec) toByte() byte {
-	return byte(c)
+// Envelope is a codec-specific envelope that preserves the wire name and raw body.
+type Envelope struct {
+	Wire string
+	Body any
 }
 
-func codecFromByte(value byte) (Codec, bool) {
-	switch value {
-	case byte(CodecCompact):
-		return CodecCompact, true
-	case byte(CodecMap):
-		return CodecMap, true
-	default:
-		return 0, false
-	}
+// CodecImpl defines a codec that can extract wire names without full decode.
+type CodecImpl interface {
+	ID() CodecID
+	Name() string
+	Encode(Message) ([]byte, error)
+	DecodeEnvelope([]byte) (Envelope, error)
+	DecodeInto(body any, dst any) error
 }
 
-type mapEnvelope struct {
-	Type string `msgpack:"type"`
-	Data any    `msgpack:"data"`
+var codecRegistry = struct {
+	mu     sync.RWMutex
+	codecs map[CodecID]CodecImpl
+}{
+	codecs: make(map[CodecID]CodecImpl),
 }
 
-type mapEnvelopeRaw struct {
-	Type string             `msgpack:"type"`
-	Data msgpack.RawMessage `msgpack:"data"`
+// RegisterCodec installs a codec implementation globally.
+func RegisterCodec(codec CodecImpl) error {
+	if codec == nil {
+		return ErrInvalidMessage{Reason: "codec must be non-nil"}
+	}
+	id := codec.ID()
+	if id == 0 {
+		return ErrInvalidMessage{Reason: "codec ID must be non-zero"}
+	}
+	if codec.Name() == "" {
+		return ErrInvalidMessage{Reason: "codec name must be non-empty"}
+	}
+	codecRegistry.mu.Lock()
+	defer codecRegistry.mu.Unlock()
+	if _, exists := codecRegistry.codecs[id]; exists {
+		return ErrInvalidMessage{Reason: "codec already registered"}
+	}
+	codecRegistry.codecs[id] = codec
+	return nil
 }
 
-func encodeMap(msg Message) ([]byte, error) {
-	wire, err := WireNameOf(msg)
-	if err != nil {
-		return nil, err
+// MustRegisterCodec registers a codec and panics on failure.
+func MustRegisterCodec(codec CodecImpl) struct{} {
+	if err := RegisterCodec(codec); err != nil {
+		panic(err)
 	}
-	env := mapEnvelope{
-		Type: wire,
-		Data: msg,
-	}
-	payload, err := msgpack.Marshal(&env)
-	if err != nil {
-		return nil, ErrCodec{Message: err.Error()}
-	}
-	return payload, nil
+	return struct{}{}
 }
 
-func decodeMapEnvelope(payload []byte) (string, msgpack.RawMessage, error) {
-	var env mapEnvelopeRaw
-	if err := msgpack.Unmarshal(payload, &env); err != nil {
-		return "", nil, ErrCodec{Message: err.Error()}
-	}
-	if env.Type == "" {
-		return "", nil, ErrCodec{Message: "map payload missing type"}
-	}
-	return env.Type, env.Data, nil
-}
-
-func encodeCompact(msg Message) ([]byte, error) {
-	if msg == nil {
-		return nil, ErrCodec{Message: "compact encode requires non-nil message"}
-	}
-	wire, err := WireNameOf(msg)
-	if err != nil {
-		return nil, err
-	}
-	rv := reflect.ValueOf(msg)
-	if rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return nil, ErrCodec{Message: "compact encode requires non-nil message"}
-		}
-		rv = rv.Elem()
-	}
-	if rv.Kind() != reflect.Struct {
-		return nil, ErrCodec{Message: "compact encode requires struct message"}
-	}
-	indices, err := compactFieldIndices(rv.Type())
-	if err != nil {
-		return nil, err
-	}
-	items := make([]any, 0, 1+len(indices))
-	items = append(items, wire)
-	for _, idx := range indices {
-		items = append(items, rv.Field(idx).Interface())
-	}
-	payload, err := msgpack.Marshal(items)
-	if err != nil {
-		return nil, ErrCodec{Message: err.Error()}
-	}
-	return payload, nil
-}
-
-func decodeCompactEnvelope(payload []byte) (string, []msgpack.RawMessage, error) {
-	var rawItems []msgpack.RawMessage
-	if err := msgpack.Unmarshal(payload, &rawItems); err != nil {
-		return "", nil, ErrCodec{Message: err.Error()}
-	}
-	if len(rawItems) == 0 {
-		return "", nil, ErrCodec{Message: "compact payload must be a non-empty array"}
-	}
-	var name string
-	if err := msgpack.Unmarshal(rawItems[0], &name); err != nil {
-		return "", nil, ErrCodec{Message: "compact message name must be a string"}
-	}
-	return name, rawItems[1:], nil
-}
-
-func compactFieldIndices(t reflect.Type) ([]int, error) {
-	if t.Kind() != reflect.Struct {
-		return nil, ErrInvalidMessage{Reason: "compact encoding requires struct type"}
-	}
-	indices := make([]int, 0, t.NumField())
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if field.PkgPath != "" {
-			return nil, ErrInvalidMessage{Reason: "compact encoding does not support unexported fields"}
-		}
-		indices = append(indices, i)
-	}
-	return indices, nil
+func codecByID(id CodecID) (CodecImpl, bool) {
+	codecRegistry.mu.RLock()
+	codec, ok := codecRegistry.codecs[id]
+	codecRegistry.mu.RUnlock()
+	return codec, ok
 }

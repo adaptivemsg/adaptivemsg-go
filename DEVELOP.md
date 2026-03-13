@@ -8,26 +8,29 @@ not a full API reference (see `README.md` for usage).
 
 - Message: any Go value used on the wire. `NamedMessage` overrides the wire name.
 - Wire name: `WireName()` or default `am.<package-leaf>.<TypeName>`.
-- Codec: Map (envelope map) or Compact (envelope array).
+- Codec: pluggable envelope + payload codec negotiated per connection (see `RegisterCodec`).
 - Connection: multiplexed streams over a single transport; default stream is ID 0.
 - Stream: FIFO per stream. `Recv` is single-consumer (guarded).
 - StreamContext: per-stream state used by handlers; holds user context and task gate.
-- Registry: map of wire name -> message factory + optional handler. Snapshotted at
+- Registry: map of wire name -> message type + optional handler. Snapshotted at
   `NewClient()`/`NewServer()`.
 
 ## Wire Protocol
 
-Handshake (client -> server, 12 bytes):
+Handshake (client -> server, v2 header + codec list):
 - magic "AM" (2 bytes)
-- version min (1 byte), version max (1 byte)
-- codec (1 byte)
-- reserved (2 bytes), flags (1 byte)
+- version (1 byte)
+- codec count (1 byte, max 16)
+- flags (1 byte)
+- reserved (3 bytes)
 - max frame size (4 bytes)
+- codec list (codec count bytes)
 
 Handshake (server -> client, 12 bytes):
 - magic "AM" (2 bytes)
-- version (1 byte), accept (1 byte)
-- flags (2 bytes), reserved (2 bytes)
+- accept (1 byte), version (1 byte)
+- selected codec (1 byte)
+- flags (1 byte), reserved (2 bytes)
 - negotiated max frame size (4 bytes)
 
 Frame header (10 bytes):
@@ -38,11 +41,11 @@ Frame header (10 bytes):
 
 ## Payload Encoding
 
-Map codec:
+Map codec (MessagePack, built-in):
 - Envelope: `{type: "<wire>", data: <msgpack object>}`
 - `data` is msgpack-encoded with struct tags.
 
-Compact codec:
+Compact codec (MessagePack, built-in):
 - Envelope: `["<wire>", field1, field2, ...]`
 - Field order is the Go struct field order.
 - All fields must be exported; field count must match at decode time.
@@ -93,6 +96,8 @@ Local errors:
 - `ErrInvalidMessage`: invalid local inputs (nil, not a struct, empty wire, etc).
 - `ErrUnknownMessage`: wire name not registered in the registry.
 - `ErrUnsupportedCodec` / `ErrUnsupportedFrameVersion`: unsupported peer config.
+- `ErrNoCommonCodec`: no codec overlap during handshake.
+- `ErrTooManyCodecs`: peer sent too many codecs in the handshake.
 - `ErrRecvTimeout` / `ErrConcurrentRecv` / `ErrClosed`: runtime conditions.
 
 Remote errors:

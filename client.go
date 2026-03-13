@@ -10,15 +10,15 @@ import (
 // Client configures outbound connections.
 type Client struct {
 	timeout  time.Duration
-	codec    Codec
 	maxFrame uint32
+	codecs   []CodecID
 	registry *registry
 }
 
 // NewClient returns a client with default settings.
 func NewClient() *Client {
 	return &Client{
-		codec:    CodecMap,
+		codecs:   []CodecID{CodecMsgpackMap, CodecMsgpackCompact},
 		maxFrame: defaultMaxFrame,
 		registry: newRegistrySnapshot(),
 	}
@@ -30,9 +30,9 @@ func (c *Client) WithTimeout(timeout time.Duration) *Client {
 	return c
 }
 
-// WithCodec sets the codec used for new connections.
-func (c *Client) WithCodec(codec Codec) *Client {
-	c.codec = codec
+// WithCodecs sets the preferred codec list; the server picks the first common codec in this order.
+func (c *Client) WithCodecs(codecs ...CodecID) *Client {
+	c.codecs = append([]CodecID(nil), codecs...)
 	return c
 }
 
@@ -67,7 +67,7 @@ func (c *Client) Connect(addr string) (*Connection, error) {
 		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 	pending := newPendingConnection(conn, c.registry, nil, nil)
-	connection, err := pending.startClient(c.codec, c.maxFrame)
+	connection, err := pending.startClient(c.codecs, c.maxFrame)
 	if c.timeout > 0 {
 		_ = conn.SetDeadline(time.Time{})
 	}

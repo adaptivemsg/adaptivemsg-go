@@ -38,29 +38,20 @@ func (e ErrUnsupportedCodec) Error() string {
 	return fmt.Sprintf("unsupported codec: %d", e.Value)
 }
 
-// ErrHandshakeRejected indicates the peer rejected the handshake.
-type ErrHandshakeRejected struct{}
+// ErrNoCommonCodec indicates no codec overlap exists.
+type ErrNoCommonCodec struct{}
 
-func (e ErrHandshakeRejected) Error() string {
-	return "handshake rejected"
+func (e ErrNoCommonCodec) Error() string {
+	return "no common codec"
 }
 
-// ErrNoCommonVersion indicates no shared protocol version exists.
-type ErrNoCommonVersion struct {
-	ClientMin byte
-	ClientMax byte
-	ServerMin byte
-	ServerMax byte
+// ErrTooManyCodecs indicates the peer sent too many codecs.
+type ErrTooManyCodecs struct {
+	Count int
 }
 
-func (e ErrNoCommonVersion) Error() string {
-	return fmt.Sprintf(
-		"no common protocol version: client %d-%d, server %d-%d",
-		e.ClientMin,
-		e.ClientMax,
-		e.ServerMin,
-		e.ServerMax,
-	)
+func (e ErrTooManyCodecs) Error() string {
+	return fmt.Sprintf("too many codecs: %d", e.Count)
 }
 
 // ErrBadHandshakeMagic indicates the handshake magic is invalid.

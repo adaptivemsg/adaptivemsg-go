@@ -42,7 +42,8 @@ func newTestConnection(t *testing.T, conn net.Conn, reg *registry) *Connection {
 	pending := newPendingConnection(conn, reg, nil, nil)
 	pending.connection.config = connConfig{
 		version:  protocolVersion,
-		codec:    CodecMap,
+		codecID:  CodecMsgpackMap,
+		codec:    mustCodec(t, CodecMsgpackMap),
 		maxFrame: defaultMaxFrame,
 	}
 	pending.connection.start()
@@ -108,7 +109,7 @@ func TestConnectionReadFrameTooLarge(t *testing.T) {
 
 func TestConnectionEncodeUnsupportedCodec(t *testing.T) {
 	conn := &Connection{
-		config: connConfig{codec: Codec(99)},
+		config: connConfig{codecID: CodecID(99)},
 	}
 	_, err := conn.encodeMessage(&OkReply{})
 	var unsupported ErrUnsupportedCodec

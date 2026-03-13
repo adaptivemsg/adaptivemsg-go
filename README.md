@@ -102,7 +102,7 @@ Functions:
 
 Client:
 - `NewClient`
-- `Client.WithTimeout`, `Client.WithCodec`, `Client.WithMaxFrame`, `Client.Connect`
+- `Client.WithTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.Connect`
 
 Server:
 - `NewServer`
@@ -120,7 +120,8 @@ Context:
 - `StreamContext.SetContext`, `StreamContext.GetContext`, `StreamContext.NewTask`
 
 Codec & messages:
-- `CodecMap`, `CodecCompact`, `Codec.String`
+- `CodecID`, `CodecMsgpackMap`, `CodecMsgpackCompact`, `CodecID.String`, `CodecImpl`
+- `RegisterCodec`, `MustRegisterCodec`
 - `Message`, `NamedMessage`, `OkReply`, `ErrorReply`, `NewErrorReply`
 
 ## Error reasoning
@@ -130,8 +131,8 @@ Local input/usage errors:
 - `ErrUnknownMessage`: wire name not registered in the registry.
 
 Protocol/compat errors:
-- `ErrUnsupportedCodec`, `ErrUnsupportedFrameVersion`, `ErrNoCommonVersion`, `ErrBadHandshakeMagic`,
-  `ErrHandshakeRejected`, `ErrFrameTooLarge`, `ErrUnsupportedTransport`.
+- `ErrUnsupportedCodec`, `ErrUnsupportedFrameVersion`, `ErrNoCommonCodec`, `ErrTooManyCodecs`,
+  `ErrBadHandshakeMagic`, `ErrFrameTooLarge`, `ErrUnsupportedTransport`.
 
 Runtime errors:
 - `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`.
@@ -144,6 +145,8 @@ Remote errors:
 Notes:
 - Addresses accept `tcp://HOST:PORT`, `uds://@name` (linux abstract), or `uds:///tmp/name.sock`.
 - Abstract UDS demo: `go run -tags server ./examples/hello/cmd/server -addr uds://@adaptivemsg-hello` and `go run ./examples/hello/cmd/client -addr uds://@adaptivemsg-hello` (echo uses `@adaptivemsg-echo`).
+- Codecs are negotiated from the client's `WithCodecs` preference list; the server selects the first common codec.
+- Custom codecs implement `CodecImpl` and register with `RegisterCodec`; msgpack struct tags only apply to the msgpack built-ins.
 - Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).
 - Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.

@@ -18,6 +18,7 @@ func (n Netconn) PeerAddr() string {
 // Server accepts inbound connections and dispatches streams.
 type Server struct {
 	registry      *registry
+	codecs        []CodecID
 	onConnect     func(Netconn) error
 	onDisconnect  func(Netconn) error
 	onNewStream   func(*StreamContext)
@@ -28,6 +29,7 @@ type Server struct {
 func NewServer() *Server {
 	return &Server{
 		registry: newRegistrySnapshot(),
+		codecs:   []CodecID{CodecMsgpackMap, CodecMsgpackCompact},
 	}
 }
 
@@ -52,6 +54,12 @@ func (s *Server) OnNewStream(f func(*StreamContext)) *Server {
 // OnCloseStream registers a callback for stream closures.
 func (s *Server) OnCloseStream(f func(*StreamContext)) *Server {
 	s.onCloseStream = f
+	return s
+}
+
+// WithCodecs sets the supported codec list; client order determines selection.
+func (s *Server) WithCodecs(codecs ...CodecID) *Server {
+	s.codecs = append([]CodecID(nil), codecs...)
 	return s
 }
 
@@ -108,7 +116,7 @@ func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
 			return
 		}
 	}
-	connection, err := pending.startServer(defaultMaxFrame)
+	connection, err := pending.startServer(s.codecs, defaultMaxFrame)
 	if err != nil {
 		_ = conn.Close()
 		return

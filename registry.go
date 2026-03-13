@@ -3,8 +3,6 @@ package adaptivemsg
 import (
 	"reflect"
 	"sync"
-
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 type handlerFunc func(*StreamContext, Message) (Message, error)
@@ -12,18 +10,13 @@ type handlerFunc func(*StreamContext, Message) (Message, error)
 type registry struct {
 	mu       sync.RWMutex
 	handlers map[string]handlerFunc
-	messages map[string]*messageFactory
-}
-
-type messageFactory struct {
-	typ    reflect.Type
-	fields []int
+	messages map[string]reflect.Type
 }
 
 func newRegistry() *registry {
 	reg := &registry{
 		handlers: make(map[string]handlerFunc),
-		messages: make(map[string]*messageFactory),
+		messages: make(map[string]reflect.Type),
 	}
 	_ = reg.registerMessage(&OkReply{})
 	_ = reg.registerMessage(&ErrorReply{})
@@ -44,26 +37,28 @@ func cloneRegistry(src *registry) *registry {
 	defer src.mu.RUnlock()
 	reg := &registry{
 		handlers: make(map[string]handlerFunc, len(src.handlers)),
-		messages: make(map[string]*messageFactory, len(src.messages)),
+		messages: make(map[string]reflect.Type, len(src.messages)),
 	}
 	for wire, handler := range src.handlers {
 		reg.handlers[wire] = handler
 	}
-	for wire, factory := range src.messages {
-		fields := make([]int, len(factory.fields))
-		copy(fields, factory.fields)
-		reg.messages[wire] = &messageFactory{typ: factory.typ, fields: fields}
+	for wire, typ := range src.messages {
+		reg.messages[wire] = typ
 	}
 	return reg
 }
 
 func (r *registry) registerMessage(proto Message) error {
-	wire, factory, err := newMessageFactory(proto)
+	t, err := messageTypeOf(proto)
+	if err != nil {
+		return err
+	}
+	wire, err := WireNameOf(proto)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
-	r.messages[wire] = factory
+	r.messages[wire] = t
 	r.mu.Unlock()
 	return nil
 }
@@ -81,11 +76,11 @@ func (r *registry) handler(wire string) (handlerFunc, bool) {
 	return h, ok
 }
 
-func (r *registry) message(wire string) (*messageFactory, bool) {
+func (r *registry) message(wire string) (reflect.Type, bool) {
 	r.mu.RLock()
-	factory, ok := r.messages[wire]
+	typ, ok := r.messages[wire]
 	r.mu.RUnlock()
-	return factory, ok
+	return typ, ok
 }
 
 func (r *registry) hasHandlers() bool {
@@ -93,22 +88,6 @@ func (r *registry) hasHandlers() bool {
 	count := len(r.handlers)
 	r.mu.RUnlock()
 	return count > 0
-}
-
-func newMessageFactory(proto Message) (string, *messageFactory, error) {
-	t, err := messageTypeOf(proto)
-	if err != nil {
-		return "", nil, err
-	}
-	wire, err := WireNameOf(proto)
-	if err != nil {
-		return "", nil, err
-	}
-	fields, err := compactFieldIndices(t)
-	if err != nil {
-		return "", nil, err
-	}
-	return wire, &messageFactory{typ: t, fields: fields}, nil
 }
 
 func newMessageForReflectType(t reflect.Type) (Message, error) {
@@ -219,30 +198,4 @@ func MustRegisterGlobalType[T any]() struct{} {
 		panic(err)
 	}
 	return struct{}{}
-}
-
-func (f *messageFactory) decodeMap(raw msgpack.RawMessage) (Message, error) {
-	msg := reflect.New(f.typ)
-	if err := msgpack.Unmarshal(raw, msg.Interface()); err != nil {
-		return nil, ErrCodec{Message: err.Error()}
-	}
-	return msg.Interface(), nil
-}
-
-func (f *messageFactory) decodeCompact(values []msgpack.RawMessage) (Message, error) {
-	if len(values) != len(f.fields) {
-		return nil, ErrCompactFieldCount{Expected: len(f.fields), Got: len(values)}
-	}
-	msg := reflect.New(f.typ)
-	msgValue := msg.Elem()
-	for i, fieldIndex := range f.fields {
-		field := msgValue.Field(fieldIndex)
-		if !field.CanSet() {
-			return nil, ErrInvalidMessage{Reason: "compact decode requires exported fields"}
-		}
-		if err := msgpack.Unmarshal(values[i], field.Addr().Interface()); err != nil {
-			return nil, ErrCodec{Message: err.Error()}
-		}
-	}
-	return msg.Interface(), nil
 }

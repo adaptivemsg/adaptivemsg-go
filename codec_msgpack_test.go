@@ -12,7 +12,7 @@ type codecTestNestedInner struct {
 }
 
 type codecTestNested struct {
-	Name  string              `msgpack:"name"`
+	Name  string               `msgpack:"name"`
 	Inner codecTestNestedInner `msgpack:"inner"`
 }
 
@@ -102,7 +102,7 @@ func TestCompactEnvelopeRoundTrip(t *testing.T) {
 	if wire != "am.test.Compact" {
 		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.Compact")
 	}
-	raw := rawMessage{Wire: wire, Codec: CodecCompact, Compact: values}
+	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
 	decoded, err := decodeRawAs[*codecTestCompact](raw)
 	if err != nil {
 		t.Fatalf("decodeRawAs: %v", err)
@@ -153,9 +153,9 @@ func TestCompactFieldCountMismatch(t *testing.T) {
 		t.Fatalf("marshal field: %v", err)
 	}
 	raw := rawMessage{
-		Wire:    "am.test.CompactTwo",
-		Codec:   CodecCompact,
-		Compact: []msgpack.RawMessage{rawField},
+		Wire:  "am.test.CompactTwo",
+		Codec: CodecMsgpackCompact,
+		Body:  []msgpack.RawMessage{rawField},
 	}
 	_, err = decodeRawAs[*codecTestCompactTwo](raw)
 	var count ErrCompactFieldCount

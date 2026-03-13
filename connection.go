@@ -12,10 +12,10 @@ import (
 const (
 	streamQueueSize    = 1024
 	defaultStreamID    = 0
-	protocolVersion    = 1
+	protocolVersion    = 2
 	frameHeaderLen     = 10
-	handshakeClientLen = 12
-	handshakeServerLen = 12
+	handshakeHeaderLen = 12
+	maxCodecCount      = 16
 )
 
 var handshakeMagic = [2]byte{'A', 'M'}
@@ -24,7 +24,8 @@ const defaultMaxFrame = ^uint32(0)
 
 type connConfig struct {
 	version  byte
-	codec    Codec
+	codecID  CodecID
+	codec    CodecImpl
 	maxFrame uint32
 }
 
@@ -77,8 +78,8 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 	return &pendingConnection{connection: connection}
 }
 
-func (p *pendingConnection) startClient(codec Codec, maxFrame uint32) (*Connection, error) {
-	config, err := handshakeClient(p.connection.conn, codec, maxFrame)
+func (p *pendingConnection) startClient(codecs []CodecID, maxFrame uint32) (*Connection, error) {
+	config, err := handshakeClient(p.connection.conn, codecs, maxFrame)
 	if err != nil {
 		return nil, err
 	}
@@ -87,8 +88,8 @@ func (p *pendingConnection) startClient(codec Codec, maxFrame uint32) (*Connecti
 	return p.connection, nil
 }
 
-func (p *pendingConnection) startServer(maxFrame uint32) (*Connection, error) {
-	config, err := handshakeServer(p.connection.conn, maxFrame)
+func (p *pendingConnection) startServer(codecs []CodecID, maxFrame uint32) (*Connection, error) {
+	config, err := handshakeServer(p.connection.conn, codecs, maxFrame)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +230,7 @@ func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
 	}
 	stream := &Stream[Message]{core: core}
 	streamCtx := &StreamContext{
-		stream:  stream,
+		stream: stream,
 	}
 	c.streams[streamID] = streamCtx
 	if handlerCh != nil {
@@ -263,7 +264,7 @@ func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 			if !ok {
 				return
 			}
-			raw, err := newRawMessageFromPayload(c.config.codec, payload)
+			raw, err := newRawMessageFromPayload(c.config.codecID, payload)
 			if err != nil {
 				core.protocolError("codec_error", err.Error())
 				return
@@ -331,14 +332,10 @@ func (c *Connection) readerLoop() {
 }
 
 func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
-	switch c.config.codec {
-	case CodecCompact:
-		return encodeCompact(msg)
-	case CodecMap:
-		return encodeMap(msg)
-	default:
-		return nil, ErrUnsupportedCodec{Value: c.config.codec.toByte()}
+	if c.config.codec == nil {
+		return nil, ErrUnsupportedCodec{Value: byte(c.config.codecID)}
 	}
+	return c.config.codec.Encode(msg)
 }
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {
@@ -408,68 +405,120 @@ func (c *Connection) readFrame() (uint32, []byte, error) {
 	return streamID, payload, nil
 }
 
-func handshakeClient(conn net.Conn, codec Codec, maxFrame uint32) (connConfig, error) {
-	request := make([]byte, handshakeClientLen)
+func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConfig, error) {
+	if len(codecs) == 0 {
+		return connConfig{}, ErrInvalidMessage{Reason: "codec list must be non-empty"}
+	}
+	if len(codecs) > maxCodecCount {
+		return connConfig{}, ErrTooManyCodecs{Count: len(codecs)}
+	}
+	for _, codecID := range codecs {
+		if codecID == 0 {
+			return connConfig{}, ErrInvalidMessage{Reason: "codec ID must be non-zero"}
+		}
+		if _, ok := codecByID(codecID); !ok {
+			return connConfig{}, ErrUnsupportedCodec{Value: byte(codecID)}
+		}
+	}
+
+	request := make([]byte, handshakeHeaderLen)
 	copy(request[0:2], handshakeMagic[:])
 	request[2] = protocolVersion
-	request[3] = protocolVersion
-	request[4] = codec.toByte()
-	binary.BigEndian.PutUint16(request[5:7], 0)
+	request[3] = byte(len(codecs))
+	request[4] = 0
+	request[5] = 0
+	request[6] = 0
 	request[7] = 0
 	binary.BigEndian.PutUint32(request[8:12], maxFrame)
 	if _, err := conn.Write(request); err != nil {
 		return connConfig{}, err
 	}
+	list := make([]byte, len(codecs))
+	for i, codecID := range codecs {
+		list[i] = byte(codecID)
+	}
+	if _, err := conn.Write(list); err != nil {
+		return connConfig{}, err
+	}
 
-	response := make([]byte, handshakeServerLen)
+	response := make([]byte, handshakeHeaderLen)
 	if _, err := io.ReadFull(conn, response); err != nil {
 		return connConfig{}, err
 	}
 	if response[0] != handshakeMagic[0] || response[1] != handshakeMagic[1] {
 		return connConfig{}, ErrBadHandshakeMagic{}
 	}
-	version := response[2]
-	accept := response[3]
+	accept := response[2]
+	version := response[3]
+	selected := CodecID(response[4])
 	serverMax := binary.BigEndian.Uint32(response[8:12])
-	if accept == 0 {
-		return connConfig{}, ErrHandshakeRejected{}
-	}
 	if version != protocolVersion {
 		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
 	}
+	if accept == 0 {
+		return connConfig{}, ErrNoCommonCodec{}
+	}
+	if !containsCodec(codecs, selected) {
+		return connConfig{}, ErrNoCommonCodec{}
+	}
+	codec, ok := codecByID(selected)
+	if !ok {
+		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
+	}
 	return connConfig{
 		version:  version,
+		codecID:  selected,
 		codec:    codec,
 		maxFrame: serverMax,
 	}, nil
 }
 
-func handshakeServer(conn net.Conn, maxFrame uint32) (connConfig, error) {
-	request := make([]byte, handshakeClientLen)
+func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConfig, error) {
+	if len(codecs) == 0 {
+		return connConfig{}, ErrInvalidMessage{Reason: "codec list must be non-empty"}
+	}
+	if len(codecs) > maxCodecCount {
+		return connConfig{}, ErrTooManyCodecs{Count: len(codecs)}
+	}
+	for _, codecID := range codecs {
+		if codecID == 0 {
+			return connConfig{}, ErrInvalidMessage{Reason: "codec ID must be non-zero"}
+		}
+		if _, ok := codecByID(codecID); !ok {
+			return connConfig{}, ErrUnsupportedCodec{Value: byte(codecID)}
+		}
+	}
+
+	request := make([]byte, handshakeHeaderLen)
 	if _, err := io.ReadFull(conn, request); err != nil {
 		return connConfig{}, err
 	}
 	if request[0] != handshakeMagic[0] || request[1] != handshakeMagic[1] {
 		return connConfig{}, ErrBadHandshakeMagic{}
 	}
-	clientMin := request[2]
-	clientMax := request[3]
-	codecRaw := request[4]
+	version := request[2]
+	codecCount := int(request[3])
 	clientMaxFrame := binary.BigEndian.Uint32(request[8:12])
-
-	codec, ok := codecFromByte(codecRaw)
-	if !ok {
-		_ = writeHandshakeReply(conn, protocolVersion, 0, 0, 0)
-		return connConfig{}, ErrUnsupportedCodec{Value: codecRaw}
+	if version != protocolVersion {
+		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
 	}
-	if clientMin > protocolVersion || clientMax < protocolVersion {
-		_ = writeHandshakeReply(conn, protocolVersion, 0, 0, 0)
-		return connConfig{}, ErrNoCommonVersion{
-			ClientMin: clientMin,
-			ClientMax: clientMax,
-			ServerMin: protocolVersion,
-			ServerMax: protocolVersion,
-		}
+	if codecCount == 0 {
+		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		return connConfig{}, ErrNoCommonCodec{}
+	}
+	if codecCount > maxCodecCount {
+		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		return connConfig{}, ErrTooManyCodecs{Count: codecCount}
+	}
+	clientCodecs := make([]byte, codecCount)
+	if _, err := io.ReadFull(conn, clientCodecs); err != nil {
+		return connConfig{}, err
+	}
+	selected, ok := selectCodec(clientCodecs, codecs)
+	if !ok {
+		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		return connConfig{}, ErrNoCommonCodec{}
 	}
 	negotiatedMax := uint32(0)
 	if clientMaxFrame != 0 {
@@ -479,24 +528,51 @@ func handshakeServer(conn net.Conn, maxFrame uint32) (connConfig, error) {
 			negotiatedMax = maxFrame
 		}
 	}
-	if err := writeHandshakeReply(conn, protocolVersion, 1, 0, negotiatedMax); err != nil {
+	if err := writeHandshakeReply(conn, 1, protocolVersion, selected, negotiatedMax); err != nil {
 		return connConfig{}, err
+	}
+	codec, ok := codecByID(selected)
+	if !ok {
+		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
 	}
 	return connConfig{
 		version:  protocolVersion,
+		codecID:  selected,
 		codec:    codec,
 		maxFrame: negotiatedMax,
 	}, nil
 }
 
-func writeHandshakeReply(conn net.Conn, version byte, accept byte, flags uint16, maxFrame uint32) error {
-	response := make([]byte, handshakeServerLen)
+func writeHandshakeReply(conn net.Conn, accept byte, version byte, codecID CodecID, maxFrame uint32) error {
+	response := make([]byte, handshakeHeaderLen)
 	copy(response[0:2], handshakeMagic[:])
-	response[2] = version
-	response[3] = accept
-	binary.BigEndian.PutUint16(response[4:6], flags)
-	binary.BigEndian.PutUint16(response[6:8], 0)
+	response[2] = accept
+	response[3] = version
+	response[4] = byte(codecID)
+	response[5] = 0
+	response[6] = 0
+	response[7] = 0
 	binary.BigEndian.PutUint32(response[8:12], maxFrame)
 	_, err := conn.Write(response)
 	return err
+}
+
+func containsCodec(codecs []CodecID, id CodecID) bool {
+	for _, codec := range codecs {
+		if codec == id {
+			return true
+		}
+	}
+	return false
+}
+
+func selectCodec(clientCodecs []byte, supported []CodecID) (CodecID, bool) {
+	for _, raw := range clientCodecs {
+		for _, sup := range supported {
+			if raw == byte(sup) {
+				return sup, true
+			}
+		}
+	}
+	return 0, false
 }
