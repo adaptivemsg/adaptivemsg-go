@@ -18,7 +18,7 @@ type Client struct {
 // NewClient returns a client with default settings.
 func NewClient() *Client {
 	return &Client{
-		codecs:   []CodecID{CodecMsgpackMap, CodecMsgpackCompact},
+		codecs:   []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
 		maxFrame: defaultMaxFrame,
 		registry: newRegistrySnapshot(),
 	}

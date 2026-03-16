@@ -145,7 +145,7 @@ Remote errors:
 Notes:
 - Addresses accept `tcp://HOST:PORT`, `uds://@name` (linux abstract), or `uds:///tmp/name.sock`.
 - Abstract UDS demo: `go run -tags server ./examples/hello/cmd/server -addr uds://@adaptivemsg-hello` and `go run ./examples/hello/cmd/client -addr uds://@adaptivemsg-hello` (echo uses `@adaptivemsg-echo`).
-- Codecs are negotiated from the client's `WithCodecs` preference list; the server selects the first common codec.
+- Codecs are negotiated from the client's `WithCodecs` preference list; the server selects the first common codec. Defaults are compact-first.
 - Custom codecs implement `CodecImpl` and register with `RegisterCodec`; msgpack struct tags only apply to the msgpack built-ins.
 - Compact codec uses positional arrays; nested structs are encoded as arrays when eligible, but types with custom msgpack/binary/text encoders or unexported fields fall back to msgpack's normal encoding (typically maps), so struct tags may still apply there.
 - Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).

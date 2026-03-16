@@ -29,7 +29,7 @@ type Server struct {
 func NewServer() *Server {
 	return &Server{
 		registry: newRegistrySnapshot(),
-		codecs:   []CodecID{CodecMsgpackMap, CodecMsgpackCompact},
+		codecs:   []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
 	}
 }
 
