@@ -1,3 +1,5 @@
+//go:generate go run ../../cmd/amgen --in=./message.go --out=./message.rs
+
 package hello
 
 type HelloRequest struct {
