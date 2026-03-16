@@ -8,7 +8,7 @@ import (
 )
 
 type connTestEchoRequest struct {
-	Text string `msgpack:"text"`
+	Text string `am:"text"`
 }
 
 func (*connTestEchoRequest) WireName() string {
@@ -20,7 +20,7 @@ func (r *connTestEchoRequest) Handle(*StreamContext) (Message, error) {
 }
 
 type connTestEchoReply struct {
-	Text string `msgpack:"text"`
+	Text string `am:"text"`
 }
 
 func (*connTestEchoReply) WireName() string {

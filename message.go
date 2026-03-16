@@ -22,8 +22,8 @@ func (*OkReply) WireName() string {
 
 // ErrorReply is the standard error payload sent over the wire.
 type ErrorReply struct {
-	Code    string `msgpack:"code"`
-	Message string `msgpack:"message"`
+	Code    string `am:"code"`
+	Message string `am:"message"`
 }
 
 func (*ErrorReply) WireName() string {

@@ -18,16 +18,16 @@ import (
 )
 
 type HelloRequest struct {
-	Who string `msgpack:"who"`
+	Who string `am:"who"`
 }
 
 type HelloInternal struct {
-	TraceID string `msgpack:"trace_id"`
+	TraceID string `am:"trace_id"`
 }
 
 type HelloReply struct {
-	Answer   string        `msgpack:"answer"`
-	Internal HelloInternal `msgpack:"internal"`
+	Answer   string        `am:"answer"`
+	Internal HelloInternal `am:"internal"`
 }
 
 func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {
@@ -147,6 +147,7 @@ Notes:
 - Abstract UDS demo: `go run -tags server ./examples/hello/cmd/server -addr uds://@adaptivemsg-hello` and `go run ./examples/hello/cmd/client -addr uds://@adaptivemsg-hello` (echo uses `@adaptivemsg-echo`).
 - Codecs are negotiated from the client's `WithCodecs` preference list; the server selects the first common codec.
 - Custom codecs implement `CodecImpl` and register with `RegisterCodec`; msgpack struct tags only apply to the msgpack built-ins.
+- Compact codec uses positional arrays; nested structs are encoded as arrays when eligible, but types with custom msgpack/binary/text encoders or unexported fields fall back to msgpack's normal encoding (typically maps), so struct tags may still apply there.
 - Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).
 - Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.

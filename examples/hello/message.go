@@ -1,15 +1,15 @@
 package hello
 
 type HelloRequest struct {
-	Who      string `msgpack:"who"`
-	Question string `msgpack:"question"`
+	Who      string `am:"who"`
+	Question string `am:"question"`
 }
 
 type HelloReply struct {
-	Answer   string        `msgpack:"answer"`
-	Internal HelloInternal `msgpack:"internal"`
+	Answer   string        `am:"answer"`
+	Internal HelloInternal `am:"internal"`
 }
 
 type HelloInternal struct {
-	TraceID string `msgpack:"trace_id"`
+	TraceID string `am:"trace_id"`
 }

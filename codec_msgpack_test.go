@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -8,12 +9,12 @@ import (
 )
 
 type codecTestNestedInner struct {
-	Count int `msgpack:"count"`
+	Count int `am:"count"`
 }
 
 type codecTestNested struct {
-	Name  string               `msgpack:"name"`
-	Inner codecTestNestedInner `msgpack:"inner"`
+	Name  string               `am:"name"`
+	Inner codecTestNestedInner `am:"inner"`
 }
 
 func (*codecTestNested) WireName() string {
@@ -21,8 +22,8 @@ func (*codecTestNested) WireName() string {
 }
 
 type codecTestCompact struct {
-	A string `msgpack:"a"`
-	B int    `msgpack:"b"`
+	A string `am:"a"`
+	B int    `am:"b"`
 }
 
 func (*codecTestCompact) WireName() string {
@@ -30,16 +31,53 @@ func (*codecTestCompact) WireName() string {
 }
 
 type codecTestCompactHidden struct {
-	a string `msgpack:"a"`
+	a string `am:"a"`
 }
 
 func (*codecTestCompactHidden) WireName() string {
 	return "am.test.CompactHidden"
 }
 
+type codecTestCompactCustom struct {
+	Name  string               `am:"name"`
+	Inner codecTestCustomInner `am:"inner"`
+}
+
+func (*codecTestCompactCustom) WireName() string {
+	return "am.test.CompactCustom"
+}
+
+type codecTestCustomInner struct {
+	Value string
+}
+
+func (c *codecTestCustomInner) MarshalMsgpack() ([]byte, error) {
+	return msgpack.Marshal(map[string]any{
+		"value": c.Value,
+	})
+}
+
+func (c *codecTestCustomInner) UnmarshalMsgpack(b []byte) error {
+	var decoded map[string]string
+	if err := msgpack.Unmarshal(b, &decoded); err != nil {
+		return err
+	}
+	c.Value = decoded["value"]
+	return nil
+}
+
+type codecTestCompactNested struct {
+	Name  string               `am:"name"`
+	Inner codecTestNestedInner `am:"inner"`
+}
+
+func (*codecTestCompactNested) WireName() string {
+	return "am.test.CompactNested"
+}
+
 type codecTestCompactTwo struct {
-	A string `msgpack:"a"`
-	B string `msgpack:"b"`
+	A string `am:"a"`
+	B string `am:"b"`
 }
 
 func (*codecTestCompactTwo) WireName() string {
@@ -64,7 +102,9 @@ func TestMapEnvelopeRoundTrip(t *testing.T) {
 	}
 
 	var decoded codecTestNested
-	if err := msgpack.Unmarshal(raw, &decoded); err != nil {
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	dec.SetCustomStructTag("am")
+	if err := dec.Decode(&decoded); err != nil {
 		t.Fatalf("decode message: %v", err)
 	}
 	if decoded.Name != "hello" || decoded.Inner.Count != 7 {
@@ -73,13 +113,16 @@ func TestMapEnvelopeRoundTrip(t *testing.T) {
 }
 
 func TestMapEnvelopeMissingType(t *testing.T) {
-	payload, err := msgpack.Marshal(map[string]any{
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	enc.SetCustomStructTag("am")
+	err := enc.Encode(map[string]any{
 		"data": map[string]any{"name": "hello"},
 	})
 	if err != nil {
 		t.Fatalf("marshal map: %v", err)
 	}
-	_, _, err = decodeMapEnvelope(payload)
+	_, _, err = decodeMapEnvelope(buf.Bytes())
 	var codec ErrCodec
 	if !errors.As(err, &codec) {
 		t.Fatalf("expected ErrCodec, got %v", err)
@@ -108,6 +151,72 @@ func TestCompactEnvelopeRoundTrip(t *testing.T) {
 		t.Fatalf("decodeRawAs: %v", err)
 	}
 	if decoded.A != "hi" || decoded.B != 42 {
+		t.Fatalf("decoded mismatch: %#v", decoded)
+	}
+}
+
+func TestCompactEnvelopeNestedStruct(t *testing.T) {
+	payload, err := encodeCompact(&codecTestCompactNested{
+		Name:  "hello",
+		Inner: codecTestNestedInner{Count: 7},
+	})
+	if err != nil {
+		t.Fatalf("encodeCompact: %v", err)
+	}
+
+	wire, values, err := decodeCompactEnvelope(payload)
+	if err != nil {
+		t.Fatalf("decodeCompactEnvelope: %v", err)
+	}
+	if wire != "am.test.CompactNested" {
+		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.CompactNested")
+	}
+
+	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
+	decoded, err := decodeRawAs[*codecTestCompactNested](raw)
+	if err != nil {
+		t.Fatalf("decodeRawAs: %v", err)
+	}
+	if decoded.Name != "hello" || decoded.Inner.Count != 7 {
+		t.Fatalf("decoded mismatch: %#v", decoded)
+	}
+}
+
+func TestCompactEnvelopeNestedCustomFallback(t *testing.T) {
+	payload, err := encodeCompact(&codecTestCompactCustom{
+		Name:  "hello",
+		Inner: codecTestCustomInner{Value: "ok"},
+	})
+	if err != nil {
+		t.Fatalf("encodeCompact: %v", err)
+	}
+
+	wire, values, err := decodeCompactEnvelope(payload)
+	if err != nil {
+		t.Fatalf("decodeCompactEnvelope: %v", err)
+	}
+	if wire != "am.test.CompactCustom" {
+		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.CompactCustom")
+	}
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+
+	var nested map[string]any
+	dec := msgpack.NewDecoder(bytes.NewReader(values[1]))
+	if err := dec.Decode(&nested); err != nil {
+		t.Fatalf("decode nested raw: %v", err)
+	}
+	if nested["value"] != "ok" {
+		t.Fatalf("unexpected nested value: %#v", nested)
+	}
+
+	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
+	decoded, err := decodeRawAs[*codecTestCompactCustom](raw)
+	if err != nil {
+		t.Fatalf("decodeRawAs: %v", err)
+	}
+	if decoded.Name != "hello" || decoded.Inner.Value != "ok" {
 		t.Fatalf("decoded mismatch: %#v", decoded)
 	}
 }

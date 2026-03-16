@@ -7,7 +7,7 @@ import (
 )
 
 type peekWireMsg struct {
-	A string `msgpack:"a"`
+	A string `am:"a"`
 }
 
 func (*peekWireMsg) WireName() string {
@@ -15,7 +15,7 @@ func (*peekWireMsg) WireName() string {
 }
 
 type ifaceMsg struct {
-	A string `msgpack:"a"`
+	A string `am:"a"`
 }
 
 func (*ifaceMsg) WireName() string {
@@ -23,7 +23,7 @@ func (*ifaceMsg) WireName() string {
 }
 
 type expectedMsg struct {
-	A string `msgpack:"a"`
+	A string `am:"a"`
 }
 
 func (*expectedMsg) WireName() string {

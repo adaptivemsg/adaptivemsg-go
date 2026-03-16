@@ -1,28 +1,28 @@
 package echo
 
 type MessageRequest struct {
-	Msg string `msgpack:"msg"`
-	Num int32  `msgpack:"num"`
+	Msg string `am:"msg"`
+	Num int32  `am:"num"`
 }
 
 type MessageReply struct {
-	Msg       string `msgpack:"msg"`
-	Num       int32  `msgpack:"num"`
-	Signature string `msgpack:"signature"`
+	Msg       string `am:"msg"`
+	Num       int32  `am:"num"`
+	Signature string `am:"signature"`
 }
 
 type SubWhoElseEvent struct{}
 
 type WhoElseEvent struct {
-	Addr string `msgpack:"addr"`
+	Addr string `am:"addr"`
 }
 
 type WhoElse struct{}
 
 type WhoElseReply struct {
-	Clients string `msgpack:"clients"`
+	Clients string `am:"clients"`
 }
 
 type MessageTimeout struct {
-	Secs uint64 `msgpack:"secs"`
+	Secs uint64 `am:"secs"`
 }
