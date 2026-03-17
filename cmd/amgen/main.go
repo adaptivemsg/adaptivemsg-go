@@ -108,7 +108,8 @@ func run(input, out string) error {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return fmt.Errorf("output must be inside repo root %s", repoRoot)
 	}
-	if err := checkRootCargo(repoRoot); err != nil {
+	needCargo, err := checkRootCargo(repoRoot, file.Name.Name, filepath.ToSlash(rel))
+	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
@@ -117,7 +118,10 @@ func run(input, out string) error {
 	if err := os.WriteFile(outAbs, message, 0o644); err != nil {
 		return err
 	}
-	return writeRootCargo(repoRoot, file.Name.Name, filepath.ToSlash(rel))
+	if needCargo {
+		return writeRootCargo(repoRoot, file.Name.Name, filepath.ToSlash(rel))
+	}
+	return nil
 }
 
 func renderRust(moduleName string, outputs []typeOutput, usesMap bool) ([]byte, error) {
@@ -145,22 +149,27 @@ func writeRootCargo(repoRoot, crateName, libPath string) error {
 	if !isValidCrateName(crateName) {
 		return fmt.Errorf("package name %q is not a valid crate name", crateName)
 	}
-	if err := checkRootCargo(repoRoot); err != nil {
-		return err
-	}
 	cargo := renderRootCargo(crateName, libPath)
 	cargoPath := filepath.Join(repoRoot, "Cargo.toml")
 	return os.WriteFile(cargoPath, []byte(cargo), 0o644)
 }
 
-func checkRootCargo(repoRoot string) error {
+func checkRootCargo(repoRoot, crateName, libPath string) (bool, error) {
 	cargoPath := filepath.Join(repoRoot, "Cargo.toml")
 	if _, err := os.Stat(cargoPath); err == nil {
-		return fmt.Errorf("Cargo.toml already exists at %s", cargoPath)
+		existing, err := os.ReadFile(cargoPath)
+		if err != nil {
+			return false, err
+		}
+		expected := renderRootCargo(crateName, libPath)
+		if strings.TrimSpace(string(existing)) == strings.TrimSpace(expected) {
+			return false, nil
+		}
+		return false, fmt.Errorf("Cargo.toml already exists at %s", cargoPath)
 	} else if !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 func findGoModRoot(start string) (string, error) {
@@ -261,7 +270,13 @@ func renderStruct(name string, st *ast.StructType, structNames map[string]bool) 
 		if !ast.IsExported(nameIdent.Name) {
 			continue
 		}
-		tagName, omit := parseAMTag(field.Tag, nameIdent.Name)
+		tagName, omit, hasTag, err := parseAMTag(field.Tag)
+		if err != nil {
+			return "", false, fmt.Errorf("%s.%s: %w", name, nameIdent.Name, err)
+		}
+		if !hasTag {
+			return "", false, fmt.Errorf("missing am tag on %s.%s (add am:%q or am:\"-\")", name, nameIdent.Name, toSnake(nameIdent.Name))
+		}
 		if omit {
 			continue
 		}
@@ -289,7 +304,10 @@ func renderStruct(name string, st *ast.StructType, structNames map[string]bool) 
 			usesMap = true
 		}
 
-		writeLine(&buf, 1, fmt.Sprintf("#[serde(rename = %q)]", tagName))
+		serdeName := strings.TrimPrefix(rustField, "r#")
+		if tagName != serdeName {
+			writeLine(&buf, 1, fmt.Sprintf("#[serde(rename = %q)]", tagName))
+		}
 		writeLine(&buf, 1, fmt.Sprintf("pub %s: %s,", rustField, rustTy))
 	}
 
@@ -297,9 +315,9 @@ func renderStruct(name string, st *ast.StructType, structNames map[string]bool) 
 	return buf.String(), usesMap, nil
 }
 
-func parseAMTag(tag *ast.BasicLit, fieldName string) (string, bool) {
+func parseAMTag(tag *ast.BasicLit) (string, bool, bool, error) {
 	if tag == nil {
-		return fieldName, false
+		return "", false, false, nil
 	}
 	raw := tag.Value
 	unquoted, err := strconv.Unquote(raw)
@@ -308,16 +326,16 @@ func parseAMTag(tag *ast.BasicLit, fieldName string) (string, bool) {
 	}
 	amTag := reflect.StructTag(unquoted).Get("am")
 	if amTag == "" {
-		return fieldName, false
+		return "", false, false, nil
 	}
 	name, _, _ := strings.Cut(amTag, ",")
 	if name == "" {
-		return fieldName, false
+		return "", false, true, fmt.Errorf("am tag must include a name or '-'")
 	}
 	if name == "-" {
-		return "", true
+		return "", true, true, nil
 	}
-	return name, false
+	return name, false, true, nil
 }
 
 func rustType(expr ast.Expr, structNames map[string]bool, mapKey bool) (string, bool, error) {
