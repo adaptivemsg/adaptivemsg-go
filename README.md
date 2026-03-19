@@ -5,6 +5,12 @@ Go runtime for the adaptivemsg wire protocol.
 This repository is the Go sibling of `adaptivemsg-rust` and is intended to stay
 in lockstep with the protocol defined in `adaptivemsg-doc`.
 
+## Code generation (amgen-go)
+
+Use `//go:generate go run <module>/cmd/amgen-go` in your `message.go`. `amgen-go` reads
+`GOFILE` from `go generate` and writes a sibling `.rs` file with the same base
+name. Exported fields must include explicit `am:"..."` tags.
+
 ## Client/server example
 
 ```go

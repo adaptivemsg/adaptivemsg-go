@@ -1,4 +1,4 @@
-//go:generate go run ../../cmd/amgen --in=./message.go --out=./message.rs
+//go:generate go run ../../cmd/amgen-go
 
 package hello
 
