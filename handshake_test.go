@@ -18,12 +18,11 @@ func writeHandshakeRequest(conn net.Conn, version byte, codecs []byte, maxFrame 
 	req[6] = 0
 	req[7] = 0
 	binary.BigEndian.PutUint32(req[8:12], maxFrame)
-	if _, err := conn.Write(req); err != nil {
+	if err := writeFull(conn, req); err != nil {
 		return err
 	}
 	if len(codecs) > 0 {
-		_, err := conn.Write(codecs)
-		return err
+		return writeFull(conn, codecs)
 	}
 	return nil
 }
@@ -241,5 +240,31 @@ func TestHandshakeClientUnsupportedVersion(t *testing.T) {
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("server write: %v", err)
+	}
+}
+
+func TestHandshakeShortWrites(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := handshakeServer(&shortWriteConn{Conn: serverConn, maxWrite: 3}, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024)
+		errCh <- err
+	}()
+
+	clientCfg, err := handshakeClient(&shortWriteConn{Conn: clientConn, maxWrite: 2}, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048)
+	if err != nil {
+		t.Fatalf("handshakeClient: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("handshakeServer: %v", err)
+	}
+	if clientCfg.codecID != CodecMsgpackMap {
+		t.Fatalf("client codec got %v want %v", clientCfg.codecID, CodecMsgpackMap)
+	}
+	if clientCfg.maxFrame != 1024 {
+		t.Fatalf("client maxFrame got %d want %d", clientCfg.maxFrame, 1024)
 	}
 }

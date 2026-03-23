@@ -1,8 +1,10 @@
 package adaptivemsg
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 )
@@ -151,4 +153,64 @@ func TestConnectionSendRecvWithHandler(t *testing.T) {
 	if remote.Message != "boom" {
 		t.Fatalf("remote message got %q want %q", remote.Message, "boom")
 	}
+}
+
+func TestConnectionWriteFrameShortWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	writer := &Connection{
+		conn: &shortWriteConn{Conn: clientConn, maxWrite: 3},
+		config: connConfig{
+			version:  protocolVersion,
+			maxFrame: defaultMaxFrame,
+		},
+	}
+	reader := &Connection{
+		conn: serverConn,
+		config: connConfig{
+			version:  protocolVersion,
+			maxFrame: defaultMaxFrame,
+		},
+	}
+
+	payload := []byte("hello, short write")
+	errCh := make(chan error, 1)
+	go func() {
+		streamID, gotPayload, err := reader.readFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if streamID != 7 {
+			errCh <- errors.New("unexpected stream id")
+			return
+		}
+		if !bytes.Equal(gotPayload, payload) {
+			errCh <- errors.New("unexpected payload")
+			return
+		}
+		errCh <- nil
+	}()
+
+	if err := writer.writeFrame(7, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+}
+
+func TestWriteFullZeroWrite(t *testing.T) {
+	err := writeFull(zeroWriter{}, []byte("x"))
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("expected io.ErrShortWrite, got %v", err)
+	}
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) {
+	return 0, nil
 }

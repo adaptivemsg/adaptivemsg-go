@@ -7,6 +7,22 @@ import (
 
 const frameHeaderLen = 10
 
+func writeFull(w io.Writer, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
 func (c *Connection) buildHeader(streamID uint32, payloadLen int) ([frameHeaderLen]byte, error) {
 	if payloadLen > int(^uint32(0)) {
 		return [frameHeaderLen]byte{}, ErrFrameTooLarge{Size: payloadLen}
@@ -37,10 +53,10 @@ func (c *Connection) writeFrame(streamID uint32, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err := c.conn.Write(header[:]); err != nil {
+	if err := writeFull(c.conn, header[:]); err != nil {
 		return err
 	}
-	if _, err := c.conn.Write(payload); err != nil {
+	if err := writeFull(c.conn, payload); err != nil {
 		return err
 	}
 	return nil

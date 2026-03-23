@@ -30,14 +30,14 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 	request[6] = 0
 	request[7] = 0
 	binary.BigEndian.PutUint32(request[8:12], maxFrame)
-	if _, err := conn.Write(request); err != nil {
+	if err := writeFull(conn, request); err != nil {
 		return connConfig{}, err
 	}
 	list := make([]byte, len(codecs))
 	for i, codecID := range codecs {
 		list[i] = byte(codecID)
 	}
-	if _, err := conn.Write(list); err != nil {
+	if err := writeFull(conn, list); err != nil {
 		return connConfig{}, err
 	}
 
@@ -163,8 +163,7 @@ func writeHandshakeReply(conn net.Conn, accept byte, version byte, codecID Codec
 	response[6] = 0
 	response[7] = 0
 	binary.BigEndian.PutUint32(response[8:12], maxFrame)
-	_, err := conn.Write(response)
-	return err
+	return writeFull(conn, response)
 }
 
 func containsCodec(codecs []CodecID, id CodecID) bool {
