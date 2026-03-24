@@ -17,6 +17,7 @@ func main() {
 	var streamSeq atomic.Uint64
 
 	server := am.NewServer().
+		WithRecovery(am.ServerRecoveryOptions{Enable: true}).
 		OnConnect(func(netconn am.Netconn) error {
 			addr := netconn.PeerAddr()
 			if addr == "" {
@@ -41,7 +42,7 @@ func main() {
 			log.Printf("on new stream: %d", id)
 		})
 
-	log.Printf("echo server listening on %s", *addr)
+	log.Printf("echo server listening on %s (recovery/v3 enabled)", *addr)
 	if err := server.Serve(*addr); err != nil {
 		log.Fatal(err)
 	}

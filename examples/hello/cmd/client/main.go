@@ -14,7 +14,7 @@ func main() {
 	addr := flag.String("addr", "tcp://127.0.0.1:5555", "server address (examples: tcp://127.0.0.1:5555, uds://@adaptivemsg-hello, uds:///tmp/adaptivemsg-hello.sock)")
 	flag.Parse()
 
-	client := am.NewClient()
+	client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
 	conn, err := client.Connect(*addr)
 	if err != nil {
 		log.Fatal(err)

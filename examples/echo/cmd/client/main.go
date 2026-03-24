@@ -16,7 +16,7 @@ func main() {
 	cmd := flag.String("cmd", "echo", "echo (default), timeout, whoelse, or whoelse_sub")
 	flag.Parse()
 
-	client := am.NewClient()
+	client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
 	conn, err := client.Connect(*addr)
 	if err != nil {
 		log.Fatal(err)
@@ -36,7 +36,7 @@ func main() {
 			log.Fatal(err)
 		}
 	default:
-		if err := echoDemo(conn, *addr); err != nil {
+		if err := echoDemo(conn); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -112,7 +112,7 @@ func whoelseQueryDemo(conn *am.Connection) error {
 	return nil
 }
 
-func echoDemo(conn *am.Connection, addr string) error {
+func echoDemo(conn *am.Connection) error {
 	msg := "ni hao"
 	var num int32
 
@@ -125,8 +125,7 @@ func echoDemo(conn *am.Connection, addr string) error {
 		}
 		log.Printf("%s:%d ==> %s:%d, %s", msg, num, rep.Msg, rep.Num, rep.Signature)
 	}
-
-	return concurrentDemo(addr)
+	return nil
 }
 
 func concurrentDemo(addr string) error {
@@ -145,7 +144,7 @@ func concurrentDemo(addr string) error {
 		go func() {
 			defer clientWG.Done()
 
-			client := am.NewClient()
+			client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
 			conn, err := client.Connect(addr)
 			if err != nil {
 				reportErr(err)
