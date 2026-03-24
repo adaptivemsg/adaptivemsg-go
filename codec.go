@@ -23,6 +23,8 @@ type Envelope struct {
 type CodecImpl interface {
 	ID() CodecID
 	Name() string
+	// Encode returns a payload owned by the caller. Implementations must not
+	// mutate or reuse the returned backing storage after Encode returns.
 	Encode(Message) ([]byte, error)
 	DecodeEnvelope([]byte) (Envelope, error)
 	DecodeInto(body any, dst any) error

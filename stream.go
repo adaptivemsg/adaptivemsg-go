@@ -240,7 +240,7 @@ func (s *streamCore) sendBoxed(msg Message) error {
 	if err != nil {
 		return err
 	}
-	frame := outboundFrame{streamID: s.id, payload: payload}
+	frame := outboundFrame{streamID: s.id, seq: s.connection.nextOutboundSeq(), payload: payload}
 	return s.connection.enqueueFrame(frame)
 }
 

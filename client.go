@@ -13,6 +13,7 @@ type Client struct {
 	maxFrame uint32
 	codecs   []CodecID
 	registry *registry
+	recovery ClientRecoveryOptions
 }
 
 // NewClient returns a client with default settings.
@@ -21,6 +22,7 @@ func NewClient() *Client {
 		codecs:   []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
 		maxFrame: defaultMaxFrame,
 		registry: newRegistrySnapshot(),
+		recovery: defaultClientRecoveryOptions(),
 	}
 }
 
@@ -42,35 +44,53 @@ func (c *Client) WithMaxFrame(maxFrame uint32) *Client {
 	return c
 }
 
+// WithRecovery configures recovery behavior and returns the client.
+func (c *Client) WithRecovery(opts ClientRecoveryOptions) *Client {
+	c.recovery = opts.normalized()
+	return c
+}
+
 // Connect dials the address and returns a live Connection.
 func (c *Client) Connect(addr string) (*Connection, error) {
+	versions := []byte{protocolVersionV2}
+	if c.recovery.Enable {
+		versions = []byte{protocolVersionV3, protocolVersionV2}
+	}
+	var lastErr error
+	for _, version := range versions {
+		connection, err := c.connectVersion(addr, version)
+		if err == nil {
+			return connection, nil
+		}
+		lastErr = err
+		if version == protocolVersionV3 {
+			var unsupported ErrUnsupportedFrameVersion
+			if errors.As(err, &unsupported) && unsupported.Version == protocolVersionV2 {
+				continue
+			}
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+func (c *Client) connectVersion(addr string, version byte) (*Connection, error) {
 	if c.registry == nil {
 		c.registry = newRegistrySnapshot()
 	}
-	network, address, err := parseAddr(addr)
-	if err != nil {
-		return nil, err
-	}
-	var conn net.Conn
-	if network == "unix" {
-		conn, err = dialUDS(address, c.timeout)
-	} else {
-		conn, err = dialTCP(address, c.timeout)
-	}
+	conn, err := c.dial(addr)
 	if err != nil {
 		if c.timeout > 0 && isTimeout(err) {
 			return nil, ErrConnectTimeout{}
 		}
 		return nil, err
 	}
-	if c.timeout > 0 {
+	deadlineSet := c.timeout > 0
+	if deadlineSet {
 		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 	pending := newPendingConnection(conn, c.registry, nil, nil)
-	connection, err := pending.startClient(c.codecs, c.maxFrame)
-	if c.timeout > 0 {
-		_ = conn.SetDeadline(time.Time{})
-	}
+	config, err := handshakeClient(conn, c.codecs, c.maxFrame, version)
 	if err != nil {
 		_ = conn.Close()
 		if c.timeout > 0 && isTimeout(err) {
@@ -78,7 +98,104 @@ func (c *Client) Connect(addr string) (*Connection, error) {
 		}
 		return nil, err
 	}
+	if config.version != protocolVersionV3 {
+		if deadlineSet {
+			_ = conn.SetDeadline(time.Time{})
+		}
+		return pending.startWithConfig(config), nil
+	}
+	connection, err := c.startRecoveryConnection(addr, pending, config)
+	if deadlineSet {
+		_ = conn.SetDeadline(time.Time{})
+	}
+	return connection, err
+}
+
+func (c *Client) startRecoveryConnection(addr string, pending *pendingConnection, config connConfig) (*Connection, error) {
+	req := attachRequest{mode: attachModeNew}
+	if err := writeAttachRequest(pending.connection.conn, req); err != nil {
+		_ = pending.connection.conn.Close()
+		return nil, err
+	}
+	resp, err := readAttachResponse(pending.connection.conn)
+	if err != nil {
+		_ = pending.connection.conn.Close()
+		return nil, err
+	}
+	if resp.status != attachStatusOK {
+		_ = pending.connection.conn.Close()
+		return nil, ErrResumeRejected{Reason: "initial attach rejected"}
+	}
+
+	connection := pending.connection
+	connection.config = config
+	connection.recovery = newClientRecoveryState(c.recovery, resp.negotiated, addr, c.timeout, resp.connectionID, resp.resumeSecret)
+	connection.attachTransport(connection.conn, resp.lastRecvSeq)
+	connection.start()
 	return connection, nil
+}
+
+func (c *Connection) resumeClientTransport() (net.Conn, error) {
+	if c == nil || c.recovery == nil {
+		return nil, ErrClosed{}
+	}
+	conn, err := dialForAddr(c.recovery.addr, c.recovery.timeout)
+	if err != nil {
+		return nil, err
+	}
+	deadlineSet := c.recovery.timeout > 0
+	if deadlineSet {
+		_ = conn.SetDeadline(time.Now().Add(c.recovery.timeout))
+	}
+	config, err := handshakeClient(conn, []CodecID{c.config.codecID}, c.config.maxFrame, protocolVersionV3)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if config.codecID != c.config.codecID {
+		_ = conn.Close()
+		return nil, ErrResumeRejected{Reason: "codec changed on resume"}
+	}
+	req := attachRequest{
+		mode:         attachModeResume,
+		connectionID: c.recovery.connectionID,
+		resumeSecret: c.recovery.resumeSecret,
+		lastRecvSeq:  c.recovery.lastReceived(),
+	}
+	if err := writeAttachRequest(conn, req); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	resp, err := readAttachResponse(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if resp.status != attachStatusOK {
+		_ = conn.Close()
+		return nil, ErrResumeRejected{}
+	}
+	c.recovery.setNegotiated(resp.negotiated)
+	if deadlineSet {
+		_ = conn.SetDeadline(time.Time{})
+	}
+	c.attachTransport(conn, resp.lastRecvSeq)
+	return conn, nil
+}
+
+func (c *Client) dial(addr string) (net.Conn, error) {
+	return dialForAddr(addr, c.timeout)
+}
+
+func dialForAddr(addr string, timeout time.Duration) (net.Conn, error) {
+	network, address, err := parseAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	if network == "unix" {
+		return dialUDS(address, timeout)
+	}
+	return dialTCP(address, timeout)
 }
 
 func parseAddr(addr string) (string, string, error) {

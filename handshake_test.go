@@ -35,12 +35,12 @@ func TestHandshakeSuccess(t *testing.T) {
 	errCh := make(chan error, 1)
 	var serverCfg connConfig
 	go func() {
-		cfg, err := handshakeServer(serverConn, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024)
+		cfg, err := handshakeServer(serverConn, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024, false)
 		serverCfg = cfg
 		errCh <- err
 	}()
 
-	clientCfg, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048)
+	clientCfg, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048, protocolVersionV2)
 	if err != nil {
 		t.Fatalf("handshakeClient: %v", err)
 	}
@@ -65,15 +65,15 @@ func TestHandshakeServerTooManyCodecs(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame)
+		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame, false)
 		errCh <- err
 	}()
 
-	req := make([]byte, handshakeHeaderLen)
-	copy(req[0:2], handshakeMagic[:])
-	req[2] = protocolVersion
-	req[3] = byte(maxCodecCount + 1)
-	if _, err := clientConn.Write(req); err != nil {
+	codecs := make([]byte, maxCodecCount+1)
+	for i := range codecs {
+		codecs[i] = byte(CodecMsgpackMap)
+	}
+	if err := writeHandshakeRequest(clientConn, protocolVersion, codecs, 0); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
 	response := make([]byte, handshakeHeaderLen)
@@ -94,7 +94,7 @@ func TestHandshakeServerNoCommonCodec(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame)
+		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame, false)
 		errCh <- err
 	}()
 
@@ -119,7 +119,7 @@ func TestHandshakeServerBadMagic(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame)
+		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame, false)
 		errCh <- err
 	}()
 
@@ -158,7 +158,7 @@ func TestHandshakeClientRejected(t *testing.T) {
 		errCh <- writeHandshakeReply(serverConn, 0, protocolVersion, 0, 0)
 	}()
 
-	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0)
+	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV2)
 	var noCommon ErrNoCommonCodec
 	if !errors.As(err, &noCommon) {
 		t.Fatalf("expected ErrNoCommonCodec, got %v", err)
@@ -196,7 +196,7 @@ func TestHandshakeClientBadMagic(t *testing.T) {
 		errCh <- err
 	}()
 
-	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0)
+	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV2)
 	var badMagic ErrBadHandshakeMagic
 	if !errors.As(err, &badMagic) {
 		t.Fatalf("expected ErrBadHandshakeMagic, got %v", err)
@@ -233,7 +233,7 @@ func TestHandshakeClientUnsupportedVersion(t *testing.T) {
 		errCh <- err
 	}()
 
-	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0)
+	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV2)
 	var unsupported ErrUnsupportedFrameVersion
 	if !errors.As(err, &unsupported) {
 		t.Fatalf("expected ErrUnsupportedFrameVersion, got %v", err)
@@ -250,11 +250,11 @@ func TestHandshakeShortWrites(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := handshakeServer(&shortWriteConn{Conn: serverConn, maxWrite: 3}, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024)
+		_, err := handshakeServer(&shortWriteConn{Conn: serverConn, maxWrite: 3}, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024, false)
 		errCh <- err
 	}()
 
-	clientCfg, err := handshakeClient(&shortWriteConn{Conn: clientConn, maxWrite: 2}, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048)
+	clientCfg, err := handshakeClient(&shortWriteConn{Conn: clientConn, maxWrite: 2}, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048, protocolVersionV2)
 	if err != nil {
 		t.Fatalf("handshakeClient: %v", err)
 	}
@@ -266,5 +266,57 @@ func TestHandshakeShortWrites(t *testing.T) {
 	}
 	if clientCfg.maxFrame != 1024 {
 		t.Fatalf("client maxFrame got %d want %d", clientCfg.maxFrame, 1024)
+	}
+}
+
+func TestHandshakeV3Success(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	errCh := make(chan error, 1)
+	var serverCfg connConfig
+	go func() {
+		cfg, err := handshakeServer(serverConn, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, 1024, true)
+		serverCfg = cfg
+		errCh <- err
+	}()
+
+	clientCfg, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap, CodecMsgpackCompact}, 2048, protocolVersionV3)
+	if err != nil {
+		t.Fatalf("handshakeClient: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("handshakeServer: %v", err)
+	}
+	if clientCfg.version != protocolVersionV3 {
+		t.Fatalf("client version got %d want %d", clientCfg.version, protocolVersionV3)
+	}
+	if serverCfg.version != protocolVersionV3 {
+		t.Fatalf("server version got %d want %d", serverCfg.version, protocolVersionV3)
+	}
+}
+
+func TestHandshakeV3RejectedByLegacyServer(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := handshakeServer(serverConn, []CodecID{CodecMsgpackMap}, defaultMaxFrame, false)
+		errCh <- err
+	}()
+
+	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV3)
+	var unsupported ErrUnsupportedFrameVersion
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("expected ErrUnsupportedFrameVersion, got %v", err)
+	}
+	if unsupported.Version != protocolVersionV2 {
+		t.Fatalf("unsupported version got %d want %d", unsupported.Version, protocolVersionV2)
+	}
+	if err := <-errCh; err == nil {
+		t.Fatalf("expected server-side unsupported version error")
 	}
 }

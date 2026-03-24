@@ -59,7 +59,7 @@ func TestConnectionBuildHeaderTooLarge(t *testing.T) {
 			maxFrame: 4,
 		},
 	}
-	_, err := conn.buildHeader(1, 5)
+	_, err := conn.buildHeader(1, 0, 5)
 	var tooLarge ErrFrameTooLarge
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
@@ -70,9 +70,9 @@ func TestConnectionParseHeaderVersion(t *testing.T) {
 	conn := &Connection{
 		config: connConfig{version: protocolVersion},
 	}
-	var header [frameHeaderLen]byte
+	header := make([]byte, frameHeaderLen)
 	header[0] = protocolVersion + 1
-	_, _, err := conn.parseHeader(header)
+	_, _, _, err := conn.parseHeader(header)
 	var unsupported ErrUnsupportedFrameVersion
 	if !errors.As(err, &unsupported) {
 		t.Fatalf("expected ErrUnsupportedFrameVersion, got %v", err)
@@ -99,7 +99,7 @@ func TestConnectionReadFrameTooLarge(t *testing.T) {
 		done <- err
 	}()
 
-	_, _, err := conn.readFrame()
+	_, _, _, err := conn.readFrame()
 	var tooLarge ErrFrameTooLarge
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
@@ -178,13 +178,17 @@ func TestConnectionWriteFrameShortWrite(t *testing.T) {
 	payload := []byte("hello, short write")
 	errCh := make(chan error, 1)
 	go func() {
-		streamID, gotPayload, err := reader.readFrame()
+		streamID, seq, gotPayload, err := reader.readFrame()
 		if err != nil {
 			errCh <- err
 			return
 		}
 		if streamID != 7 {
 			errCh <- errors.New("unexpected stream id")
+			return
+		}
+		if seq != 0 {
+			errCh <- errors.New("unexpected seq")
 			return
 		}
 		if !bytes.Equal(gotPayload, payload) {
@@ -194,7 +198,58 @@ func TestConnectionWriteFrameShortWrite(t *testing.T) {
 		errCh <- nil
 	}()
 
-	if err := writer.writeFrame(7, payload); err != nil {
+	if err := writer.writeFrame(7, 0, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+}
+
+func TestConnectionWriteReadFrameV3(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	writer := &Connection{
+		conn: clientConn,
+		config: connConfig{
+			version:  protocolVersionV3,
+			maxFrame: defaultMaxFrame,
+		},
+	}
+	reader := &Connection{
+		conn: serverConn,
+		config: connConfig{
+			version:  protocolVersionV3,
+			maxFrame: defaultMaxFrame,
+		},
+	}
+
+	payload := []byte("hello, v3")
+	errCh := make(chan error, 1)
+	go func() {
+		streamID, seq, gotPayload, err := reader.readFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if streamID != 9 {
+			errCh <- errors.New("unexpected stream id")
+			return
+		}
+		if seq != 42 {
+			errCh <- errors.New("unexpected seq")
+			return
+		}
+		if !bytes.Equal(gotPayload, payload) {
+			errCh <- errors.New("unexpected payload")
+			return
+		}
+		errCh <- nil
+	}()
+
+	if err := writer.writeFrame(9, 42, payload); err != nil {
 		t.Fatalf("writeFrame: %v", err)
 	}
 	if err := <-errCh; err != nil {

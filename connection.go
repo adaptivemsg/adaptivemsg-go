@@ -21,6 +21,7 @@ type connConfig struct {
 
 type outboundFrame struct {
 	streamID uint32
+	seq      uint64
 	payload  []byte
 }
 
@@ -35,6 +36,7 @@ type Connection struct {
 	registry          *registry
 	config            connConfig
 	outbound          chan outboundFrame
+	sendNotify        chan struct{}
 	streams           map[uint32]*StreamContext
 	streamsMu         sync.Mutex
 	nextStreamID      atomic.Uint32
@@ -42,6 +44,13 @@ type Connection struct {
 	defaultStreamView *Stream[Message]
 	onNewStream       func(*StreamContext)
 	onCloseStream     func(*StreamContext)
+	nextSendSeq       atomic.Uint64
+	transportOnce     sync.Once
+	transportMu       sync.Mutex
+	transportCond     *sync.Cond
+	transportGen      uint64
+	transportResume   uint64
+	recovery          *recoveryState
 	closeOnce         sync.Once
 	closeCh           chan struct{}
 	closed            atomic.Bool
@@ -59,38 +68,53 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 		conn:          conn,
 		registry:      registry,
 		outbound:      make(chan outboundFrame, streamQueueSize),
+		sendNotify:    make(chan struct{}, 1),
 		streams:       make(map[uint32]*StreamContext),
 		onNewStream:   onNewStream,
 		onCloseStream: onCloseStream,
 		closeCh:       make(chan struct{}),
 	}
+	connection.initTransportState()
 	connection.nextStreamID.Store(0)
 	return &pendingConnection{connection: connection}
 }
 
-func (p *pendingConnection) startClient(codecs []CodecID, maxFrame uint32) (*Connection, error) {
-	config, err := handshakeClient(p.connection.conn, codecs, maxFrame)
-	if err != nil {
-		return nil, err
-	}
+func (p *pendingConnection) startWithConfig(config connConfig) *Connection {
 	p.connection.config = config
 	p.connection.start()
-	return p.connection, nil
+	return p.connection
 }
 
-func (p *pendingConnection) startServer(codecs []CodecID, maxFrame uint32) (*Connection, error) {
-	config, err := handshakeServer(p.connection.conn, codecs, maxFrame)
+func (p *pendingConnection) startClient(codecs []CodecID, maxFrame uint32, version byte) (*Connection, error) {
+	config, err := handshakeClient(p.connection.conn, codecs, maxFrame, version)
 	if err != nil {
 		return nil, err
 	}
-	p.connection.config = config
-	p.connection.start()
-	return p.connection, nil
+	return p.startWithConfig(config), nil
+}
+
+func (p *pendingConnection) startServer(codecs []CodecID, maxFrame uint32, recoveryEnabled bool) (*Connection, error) {
+	config, err := handshakeServer(p.connection.conn, codecs, maxFrame, recoveryEnabled)
+	if err != nil {
+		return nil, err
+	}
+	return p.startWithConfig(config), nil
 }
 
 func (c *Connection) start() {
 	go c.writerLoop()
 	go c.readerLoop()
+}
+
+func (c *Connection) nextOutboundSeq() uint64 {
+	if c == nil || c.config.version != protocolVersionV3 {
+		return 0
+	}
+	return c.nextSendSeq.Add(1)
+}
+
+func (c *Connection) isRecoveryEnabled() bool {
+	return c != nil && c.recovery != nil && c.config.version == protocolVersionV3
 }
 
 // Close shuts down the connection and all streams.
@@ -157,7 +181,10 @@ func (c *Connection) markClosed() {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		close(c.closeCh)
-		_ = c.conn.Close()
+		c.closeTransport()
+		if c.recovery != nil {
+			c.recovery.onClosed(c)
+		}
 		c.closeAllStreams()
 	})
 }
@@ -293,12 +320,16 @@ func (c *Connection) dispatchMessage(stream *streamCore, raw rawMessage) error {
 }
 
 func (c *Connection) writerLoop() {
+	if c.isRecoveryEnabled() {
+		c.recoveryWriterLoop()
+		return
+	}
 	for {
 		select {
 		case <-c.closeCh:
 			return
 		case frame := <-c.outbound:
-			if err := c.writeFrame(frame.streamID, frame.payload); err != nil {
+			if err := c.writeFrame(frame.streamID, frame.seq, frame.payload); err != nil {
 				c.markClosed()
 				return
 			}
@@ -307,8 +338,12 @@ func (c *Connection) writerLoop() {
 }
 
 func (c *Connection) readerLoop() {
+	if c.isRecoveryEnabled() {
+		c.recoveryReaderLoop()
+		return
+	}
 	for {
-		streamID, payload, err := c.readFrame()
+		streamID, _, payload, err := c.readFrame()
 		if err != nil {
 			c.markClosed()
 			return
@@ -329,6 +364,15 @@ func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
 }
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {
+	if c.isRecoveryEnabled() {
+		stored, err := c.recovery.replay.add(frame)
+		if err != nil {
+			return err
+		}
+		c.recovery.enqueueLive(stored)
+		c.signalSend()
+		return nil
+	}
 	select {
 	case <-c.closeCh:
 		return ErrClosed{}

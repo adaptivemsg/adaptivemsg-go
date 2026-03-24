@@ -7,7 +7,9 @@ import (
 )
 
 const (
-	protocolVersion    = 2
+	protocolVersionV2  = 2
+	protocolVersionV3  = 3
+	protocolVersion    = protocolVersionV2
 	handshakeHeaderLen = 12
 	maxCodecCount      = 16
 )
@@ -16,14 +18,17 @@ var handshakeMagic = [2]byte{'A', 'M'}
 
 const defaultMaxFrame = ^uint32(0)
 
-func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConfig, error) {
+func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version byte) (connConfig, error) {
 	if err := validateCodecList(codecs); err != nil {
 		return connConfig{}, err
+	}
+	if !isSupportedProtocolVersion(version) {
+		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
 	}
 
 	request := make([]byte, handshakeHeaderLen)
 	copy(request[0:2], handshakeMagic[:])
-	request[2] = protocolVersion
+	request[2] = version
 	request[3] = byte(len(codecs))
 	request[4] = 0
 	request[5] = 0
@@ -49,11 +54,11 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 		return connConfig{}, ErrBadHandshakeMagic{}
 	}
 	accept := response[2]
-	version := response[3]
+	replyVersion := response[3]
 	selected := CodecID(response[4])
 	serverMax := binary.BigEndian.Uint32(response[8:12])
-	if version != protocolVersion {
-		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
+	if replyVersion != request[2] {
+		return connConfig{}, ErrUnsupportedFrameVersion{Version: replyVersion}
 	}
 	if accept == 0 {
 		return connConfig{}, ErrNoCommonCodec{}
@@ -66,14 +71,14 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
 	}
 	return connConfig{
-		version:  version,
+		version:  replyVersion,
 		codecID:  selected,
 		codec:    codec,
 		maxFrame: serverMax,
 	}, nil
 }
 
-func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConfig, error) {
+func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32, recoveryEnabled bool) (connConfig, error) {
 	if err := validateCodecList(codecs); err != nil {
 		return connConfig{}, err
 	}
@@ -86,18 +91,25 @@ func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 		return connConfig{}, ErrBadHandshakeMagic{}
 	}
 	version := request[2]
+	replyVersion := supportedProtocolVersion(recoveryEnabled)
 	codecCount := int(request[3])
 	clientMaxFrame := binary.BigEndian.Uint32(request[8:12])
-	if version != protocolVersion {
-		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+	if !isSupportedProtocolVersion(version) || (version == protocolVersionV3 && !recoveryEnabled) {
+		if err := discardHandshakeCodecs(conn, codecCount); err != nil {
+			return connConfig{}, err
+		}
+		_ = writeHandshakeReply(conn, 0, replyVersion, 0, 0)
 		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
 	}
 	if codecCount == 0 {
-		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		_ = writeHandshakeReply(conn, 0, version, 0, 0)
 		return connConfig{}, ErrNoCommonCodec{}
 	}
 	if codecCount > maxCodecCount {
-		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		if err := discardHandshakeCodecs(conn, codecCount); err != nil {
+			return connConfig{}, err
+		}
+		_ = writeHandshakeReply(conn, 0, version, 0, 0)
 		return connConfig{}, ErrTooManyCodecs{Count: codecCount}
 	}
 	clientCodecs := make([]byte, codecCount)
@@ -106,11 +118,11 @@ func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 	}
 	selected, ok := selectCodec(clientCodecs, codecs)
 	if !ok {
-		_ = writeHandshakeReply(conn, 0, protocolVersion, 0, 0)
+		_ = writeHandshakeReply(conn, 0, version, 0, 0)
 		return connConfig{}, ErrNoCommonCodec{}
 	}
 	negotiatedMax := negotiateMaxFrame(clientMaxFrame, maxFrame)
-	if err := writeHandshakeReply(conn, 1, protocolVersion, selected, negotiatedMax); err != nil {
+	if err := writeHandshakeReply(conn, 1, version, selected, negotiatedMax); err != nil {
 		return connConfig{}, err
 	}
 	codec, ok := codecByID(selected)
@@ -118,11 +130,22 @@ func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32) (connConf
 		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
 	}
 	return connConfig{
-		version:  protocolVersion,
+		version:  version,
 		codecID:  selected,
 		codec:    codec,
 		maxFrame: negotiatedMax,
 	}, nil
+}
+
+func isSupportedProtocolVersion(version byte) bool {
+	return version == protocolVersionV2 || version == protocolVersionV3
+}
+
+func supportedProtocolVersion(recoveryEnabled bool) byte {
+	if recoveryEnabled {
+		return protocolVersionV3
+	}
+	return protocolVersionV2
 }
 
 func validateCodecList(codecs []CodecID) error {
@@ -151,6 +174,15 @@ func negotiateMaxFrame(clientMaxFrame, serverMaxFrame uint32) uint32 {
 		return clientMaxFrame
 	}
 	return serverMaxFrame
+}
+
+func discardHandshakeCodecs(conn net.Conn, codecCount int) error {
+	if codecCount <= 0 {
+		return nil
+	}
+	buf := make([]byte, codecCount)
+	_, err := io.ReadFull(conn, buf)
+	return err
 }
 
 func writeHandshakeReply(conn net.Conn, accept byte, version byte, codecID CodecID, maxFrame uint32) error {

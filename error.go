@@ -87,6 +87,28 @@ func (e ErrConnectTimeout) Error() string {
 	return "connect timeout"
 }
 
+// ErrReplayBufferFull indicates recovery replay buffering exceeded the configured limit.
+type ErrReplayBufferFull struct {
+	Limit int64
+	Size  int64
+}
+
+func (e ErrReplayBufferFull) Error() string {
+	return fmt.Sprintf("replay buffer full: size=%d limit=%d", e.Size, e.Limit)
+}
+
+// ErrResumeRejected indicates the peer could not reattach a resumable connection.
+type ErrResumeRejected struct {
+	Reason string
+}
+
+func (e ErrResumeRejected) Error() string {
+	if e.Reason == "" {
+		return "resume rejected"
+	}
+	return "resume rejected: " + e.Reason
+}
+
 // ErrRecvTimeout indicates a receive operation timed out.
 type ErrRecvTimeout struct{}
 
