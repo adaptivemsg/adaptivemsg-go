@@ -284,7 +284,10 @@ This is the current implementation shape for recovery-enabled connections.
   - `recovery *recoveryState`
 - Current replay-related state on `Connection`:
   - `nextSendSeq uint64`
-  - replay buffer keyed by `seq`
+  - recovery runtime uses:
+    - replay retention keyed by `seq`
+    - live send deque for newly accepted outbound frames
+    - resume deque built on reconnect from retained replay state
 - Current `recoveryState` keeps:
   - `connectionID [16]byte`
   - `resumeSecret [16]byte`
@@ -297,8 +300,13 @@ This is the current implementation shape for recovery-enabled connections.
   - `lastAckSent uint64`
   - `ackPending uint32`
   - `ackDue bool`
+  - `liveQueue` and `resumeQueue` as dedicated ring deques
+  - heartbeat/read-deadline timing mirrored into atomics for the writer hot path
   - detached expiry timer
   - client reconnect parameters and active reconnect guard
+- Current replay bookkeeping stores one canonical `frameRecord` per unacked
+  outbound frame; replay retention and send queues share pointers to that
+  record rather than duplicating `streamID`/`seq`/`payload` metadata.
 - Current detached-connection table on `Server`:
   - `map[[16]byte]*Connection`
 - detached expiry is enforced with per-connection timers
@@ -394,14 +402,16 @@ Rules:
   - user code calls `Send()` / `SendRecv()`
   - runtime encodes the message payload
   - runtime allocates the next connection-level `seq`
-  - runtime stores a retained copy of that frame in the replay buffer before
-    send returns
-  - runtime enqueues the retained frame into the live send queue
+  - runtime admits the frame into replay retention before send returns
+  - replay retention creates the canonical `frameRecord`
+  - runtime enqueues that same `frameRecord` into the live send deque
 - Replay buffer semantics:
   - the replay buffer stores unacknowledged outbound data frames in sequence
     order as a side-car retention structure
   - replay buffer accounting is byte-based, bounded by `MaxReplayBytes`
   - steady-state sending should not scan the replay buffer on every frame
+  - replay retention and live/resume send queues share one frame record; they
+    do not duplicate payload or per-frame metadata
   - on reconnect, runtime builds a temporary resume queue from replay entries
     with `seq > peerLastRecvSeq`
 - Normal write success:
@@ -421,6 +431,12 @@ Rules:
   - writer drains that resume queue before sending newly queued live frames
   - resent frames keep the same `seq` and encoded bytes; they are not rebuilt
     as new logical sends
+- Payload ownership:
+  - `CodecImpl.Encode` transfers ownership of the returned payload to the
+    caller
+  - codecs must not mutate or reuse the returned backing storage after return
+  - this allows replay retention and live send queues to share payload slices
+    without defensive copying
 - Why this structure is sufficient:
   - if peer fully received a frame, resume/ACK state causes it to be dropped
     and not resent

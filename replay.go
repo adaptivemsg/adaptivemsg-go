@@ -5,6 +5,13 @@ import (
 	"sync/atomic"
 )
 
+type frameRecord struct {
+	streamID uint32
+	seq      uint64
+	payload  []byte
+	size     int64
+}
+
 type replayEntry struct {
 	frame *frameRecord
 }
