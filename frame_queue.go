@@ -22,7 +22,7 @@ func (q *frameDeque) push(frame *frameRecord) {
 	defer q.mu.Unlock()
 
 	if len(q.buf) == 0 {
-		q.buf = make([]*frameRecord, 16)
+		q.buf = make([]*frameRecord, 32)
 	}
 	if q.size == len(q.buf) {
 		q.grow()

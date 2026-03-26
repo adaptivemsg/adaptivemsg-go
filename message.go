@@ -3,7 +3,15 @@ package adaptivemsg
 import (
 	"reflect"
 	"strings"
+	"sync"
 )
+
+type wireNameCacheKey struct {
+	ns string
+	t  reflect.Type
+}
+
+var defaultWireNameCache sync.Map
 
 // Message is the marker interface for payload types.
 type Message interface{}
@@ -81,6 +89,10 @@ func defaultWireNameForType(ns string, t reflect.Type) (string, error) {
 	if t.Kind() != reflect.Struct {
 		return "", ErrInvalidMessage{Reason: "message must be struct or pointer to struct"}
 	}
+	cacheKey := wireNameCacheKey{ns: ns, t: t}
+	if cached, ok := defaultWireNameCache.Load(cacheKey); ok {
+		return cached.(string), nil
+	}
 	pkgPath := t.PkgPath()
 	leaf := "unknown"
 	if pkgPath != "" {
@@ -91,7 +103,9 @@ func defaultWireNameForType(ns string, t reflect.Type) (string, error) {
 	if name == "" {
 		name = "unknown"
 	}
-	return ns + "." + leaf + "." + name, nil
+	wire := ns + "." + leaf + "." + name
+	defaultWireNameCache.Store(cacheKey, wire)
+	return wire, nil
 }
 
 func wireNameForValue(msg Message) string {
