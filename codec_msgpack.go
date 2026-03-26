@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding"
 	"reflect"
+	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
 	"github.com/vmihailenco/msgpack/v5/msgpcode"
@@ -96,6 +97,11 @@ type mapEnvelopeRaw struct {
 	Data msgpack.RawMessage `am:"data"`
 }
 
+type compactFieldCache struct {
+	mu     sync.RWMutex
+	values map[reflect.Type][]int
+}
+
 var (
 	msgpackMarshalerType   = reflect.TypeOf((*msgpack.Marshaler)(nil)).Elem()
 	msgpackUnmarshalerType = reflect.TypeOf((*msgpack.Unmarshaler)(nil)).Elem()
@@ -105,6 +111,7 @@ var (
 	binaryUnmarshalerType  = reflect.TypeOf((*encoding.BinaryUnmarshaler)(nil)).Elem()
 	textMarshalerType      = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 	textUnmarshalerType    = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	compactFieldsCache     = compactFieldCache{values: make(map[reflect.Type][]int)}
 )
 
 func encodeMap(msg Message) ([]byte, error) {
@@ -122,11 +129,7 @@ func encodeMap(msg Message) ([]byte, error) {
 	if err := enc.Encode(&env); err != nil {
 		return nil, ErrCodec{Message: err.Error()}
 	}
-	payload := buf.Bytes()
-	if err != nil {
-		return nil, ErrCodec{Message: err.Error()}
-	}
-	return payload, nil
+	return buf.Bytes(), nil
 }
 
 func decodeMapEnvelope(payload []byte) (string, msgpack.RawMessage, error) {
@@ -232,6 +235,12 @@ func compactFieldIndices(t reflect.Type) ([]int, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, ErrInvalidMessage{Reason: "compact encoding requires struct type"}
 	}
+	compactFieldsCache.mu.RLock()
+	cached, ok := compactFieldsCache.values[t]
+	compactFieldsCache.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
 	indices := make([]int, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
@@ -240,6 +249,9 @@ func compactFieldIndices(t reflect.Type) ([]int, error) {
 		}
 		indices = append(indices, i)
 	}
+	compactFieldsCache.mu.Lock()
+	compactFieldsCache.values[t] = indices
+	compactFieldsCache.mu.Unlock()
 	return indices, nil
 }
 
