@@ -187,3 +187,6 @@ Notes:
   - `MaxReplayBytes`: server-side byte cap for retained unacknowledged outbound frames.
   - `AckEvery` / `AckDelay`: server-selected cumulative ACK batching policy.
   - `HeartbeatInterval` / `HeartbeatTimeout`: server-selected idle failure detection policy for quiet connections.
+
+For detailed recovery protocol behavior, heartbeat/liveness semantics, and
+cross-runtime interoperability notes, see `DEVELOP.md`.

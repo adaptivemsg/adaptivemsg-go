@@ -308,7 +308,9 @@ func (s *streamCore) protocolError(code, message string) {
 	if code == "" {
 		code = "protocol_error"
 	}
-	_ = s.sendBoxed(NewErrorReply(code, message))
+	if err := s.sendBoxed(NewErrorReply(code, message)); err != nil {
+		protocolErrorReplySendFailures.Add(1)
+	}
 	s.connection.removeStream(s.id)
 }
 
@@ -341,3 +343,9 @@ func isInterfaceType[T any]() bool {
 }
 
 var errorReplyWireName = expectedWireName[*ErrorReply]()
+
+var protocolErrorReplySendFailures atomic.Uint64
+
+func protocolErrorReplySendFailureCount() uint64 {
+	return protocolErrorReplySendFailures.Load()
+}

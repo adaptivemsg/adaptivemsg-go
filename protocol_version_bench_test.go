@@ -1,7 +1,6 @@
 package adaptivemsg
 
 import (
-	"fmt"
 	"testing"
 	"time"
 )
@@ -94,32 +93,4 @@ func BenchmarkProtocolV2SendRecv(b *testing.B) {
 
 func BenchmarkProtocolV3RecoverySendRecv(b *testing.B) {
 	benchmarkProtocolSendRecv(b, true)
-}
-
-func TestProtocolV2V3PerformanceReport(t *testing.T) {
-	v2 := testing.Benchmark(BenchmarkProtocolV2SendRecv)
-	v3 := testing.Benchmark(BenchmarkProtocolV3RecoverySendRecv)
-
-	v2Ns := float64(v2.NsPerOp())
-	v3Ns := float64(v3.NsPerOp())
-	v2B := float64(v2.AllocedBytesPerOp())
-	v3B := float64(v3.AllocedBytesPerOp())
-	v2A := float64(v2.AllocsPerOp())
-	v3A := float64(v3.AllocsPerOp())
-
-	pct := func(base, current float64) float64 {
-		if base == 0 {
-			return 0
-		}
-		return (current - base) / base * 100
-	}
-
-	t.Logf("v2 baseline: %s", fmt.Sprintf("%s", v2))
-	t.Logf("v3 recovery: %s", fmt.Sprintf("%s", v3))
-	t.Logf("delta ns/op: %+0.2f%%", pct(v2Ns, v3Ns))
-	t.Logf("delta B/op: %+0.2f%%", pct(v2B, v3B))
-	t.Logf("delta allocs/op: %+0.2f%%", pct(v2A, v3A))
-
-	t.Logf("v2 ns/op: %.0f, B/op: %.0f, allocs/op: %.0f", v2Ns, v2B, v2A)
-	t.Logf("v3 ns/op: %.0f, B/op: %.0f, allocs/op: %.0f", v3Ns, v3B, v3A)
 }
