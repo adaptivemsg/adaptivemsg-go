@@ -18,7 +18,6 @@ const (
 const (
 	pendingControlNone byte = iota
 	pendingControlAck
-	pendingControlPong
 )
 
 type recoveryState struct {
@@ -53,7 +52,6 @@ type recoveryState struct {
 	ackPending    uint32
 	ackDue        bool
 	ackDueAt      time.Time
-	pongDue       bool
 	expireTimer   *time.Timer
 }
 
@@ -346,10 +344,6 @@ func (r *recoveryState) takePendingControl() (byte, uint64, bool) {
 		r.ackDueAt = time.Time{}
 		return pendingControlAck, seq, true
 	}
-	if r.pongDue {
-		r.pongDue = false
-		return pendingControlPong, 0, true
-	}
 	return pendingControlNone, 0, false
 }
 
@@ -372,7 +366,6 @@ func (r *recoveryState) onAttached() {
 	r.mu.Lock()
 	timer := r.expireTimer
 	r.expireTimer = nil
-	r.pongDue = false
 	r.mu.Unlock()
 	if timer != nil {
 		timer.Stop()
@@ -414,15 +407,6 @@ func (r *recoveryState) scheduleExpiry(c *Connection) {
 			c.markClosed()
 		}
 	})
-	r.mu.Unlock()
-}
-
-func (r *recoveryState) queuePong() {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	r.pongDue = true
 	r.mu.Unlock()
 }
 
@@ -513,11 +497,8 @@ func (c *Connection) recoveryWriterLoop() {
 			if !c.transportActive(gen, conn) {
 				break
 			}
-			if controlType, ackSeq, ok := c.recovery.takePendingControl(); ok {
-				payload := buildPongControlPayload()
-				if controlType == pendingControlAck {
-					payload = buildAckControlPayload(ackSeq)
-				}
+			if _, ackSeq, ok := c.recovery.takePendingControl(); ok {
+				payload := buildAckControlPayload(ackSeq)
 				if err := c.writeFrameTo(conn, controlStreamID, 0, payload); err != nil {
 					c.handleRecoveryTransportError(conn)
 					break
@@ -633,10 +614,8 @@ func (c *Connection) handleControlFrame(payload []byte) error {
 		c.recovery.ackReceived(value)
 		return nil
 	case controlTypePing:
-		c.recovery.queuePong()
-		c.signalSend()
-		return nil
-	case controlTypePong:
+		// Liveness is already enforced by SetReadDeadline and periodic ping.
+		// Keep ping handling as a no-op for protocol compatibility.
 		return nil
 	default:
 		return ErrInvalidMessage{Reason: "unknown control frame type"}

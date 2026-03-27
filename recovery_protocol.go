@@ -13,7 +13,6 @@ const (
 
 	controlTypeAck  = 1
 	controlTypePing = 2
-	controlTypePong = 3
 
 	attachModeNew    = 1
 	attachModeResume = 2
@@ -189,10 +188,6 @@ func buildPingControlPayload() []byte {
 	return []byte{controlTypePing}
 }
 
-func buildPongControlPayload() []byte {
-	return []byte{controlTypePong}
-}
-
 func parseControlPayload(payload []byte) (byte, uint64, error) {
 	if len(payload) == 0 {
 		return 0, 0, ErrInvalidMessage{Reason: "empty control payload"}
@@ -203,7 +198,7 @@ func parseControlPayload(payload []byte) (byte, uint64, error) {
 			return 0, 0, ErrInvalidMessage{Reason: "invalid ack control payload length"}
 		}
 		return payload[0], binary.BigEndian.Uint64(payload[1:9]), nil
-	case controlTypePing, controlTypePong:
+	case controlTypePing:
 		if len(payload) != controlHeartbeatLen {
 			return 0, 0, ErrInvalidMessage{Reason: "invalid heartbeat control payload length"}
 		}

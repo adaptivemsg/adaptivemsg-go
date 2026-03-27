@@ -206,10 +206,7 @@ func startRecoveryHeartbeatBlackholeServer(t *testing.T, opts ServerRecoveryOpti
 				return
 			}
 			if controlType == controlTypePing {
-				if err := wire.writeFrameTo(secondConn, controlStreamID, 0, buildPongControlPayload()); err != nil {
-					_ = secondConn.Close()
-					return
-				}
+				continue
 			}
 		}
 	}()
