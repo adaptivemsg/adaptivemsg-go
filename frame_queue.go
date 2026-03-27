@@ -89,3 +89,12 @@ func (q *frameDeque) grow() {
 	q.head = 0
 	q.tail = q.size
 }
+
+func (q *frameDeque) len() int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.size
+}

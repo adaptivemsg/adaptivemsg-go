@@ -142,6 +142,7 @@ func (c *Connection) attachTransport(conn net.Conn, peerLastRecvSeq uint64) {
 	c.transportGen++
 	c.transportResume = peerLastRecvSeq
 	c.transportMu.Unlock()
+	c.debug.transportAttaches.Add(1)
 
 	if oldConn != nil && oldConn != conn {
 		_ = oldConn.Close()
@@ -165,6 +166,7 @@ func (c *Connection) detachTransport(conn net.Conn) bool {
 	c.transportGen++
 	c.transportResume = 0
 	c.transportMu.Unlock()
+	c.debug.transportDetaches.Add(1)
 
 	if conn != nil {
 		_ = conn.Close()
@@ -443,14 +445,19 @@ func (c *Connection) reconnectLoop() {
 		if c.closed.Load() {
 			return
 		}
+		c.debug.reconnectAttempts.Add(1)
 		conn, err := c.resumeClientTransport()
 		if err == nil {
+			c.debug.reconnectSuccesses.Add(1)
 			_ = conn
 			return
 		}
+		c.debug.noteFailure(DebugFailureReconnectResume, "resume failed: "+err.Error())
+		c.debug.reconnectFailures.Add(1)
 		var rejected ErrResumeRejected
 		var unsupported ErrUnsupportedFrameVersion
 		if errors.As(err, &rejected) || errors.As(err, &unsupported) {
+			c.debug.noteFailure(DebugFailureReconnectTerminal, "reconnect terminal failure: "+err.Error())
 			c.markClosed()
 			return
 		}
@@ -500,6 +507,7 @@ func (c *Connection) recoveryWriterLoop() {
 			if _, ackSeq, ok := c.recovery.takePendingControl(); ok {
 				payload := buildAckControlPayload(ackSeq)
 				if err := c.writeFrameTo(conn, controlStreamID, 0, payload); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery ack write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
@@ -511,6 +519,7 @@ func (c *Connection) recoveryWriterLoop() {
 					continue
 				}
 				if err := c.writeFrameTo(conn, frame.streamID, frame.seq, frame.payload); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryResumeWrite, "recovery resume write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
@@ -523,6 +532,7 @@ func (c *Connection) recoveryWriterLoop() {
 					continue
 				}
 				if err := c.writeFrameTo(conn, frame.streamID, frame.seq, frame.payload); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
@@ -561,6 +571,7 @@ func (c *Connection) recoveryWriterLoop() {
 			}
 			if timerFired && wait == heartbeatWait {
 				if err := c.writeFrameTo(conn, controlStreamID, 0, buildPingControlPayload()); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryPingWrite, "recovery ping write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
@@ -585,18 +596,21 @@ func (c *Connection) recoveryReaderLoop() {
 			c.recovery.armReadDeadline(conn)
 			streamID, seq, payload, err := c.readFrameFrom(conn)
 			if err != nil {
+				c.debug.noteFailure(DebugFailureRecoveryRead, "recovery read failed: "+err.Error())
 				c.handleRecoveryTransportError(conn)
 				break
 			}
 			c.recovery.armReadDeadline(conn)
 			if streamID == controlStreamID {
 				if err := c.handleControlFrame(payload); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryControl, "recovery control frame failed: "+err.Error())
 					c.markClosed()
 					return
 				}
 				continue
 			}
 			if err := c.handleRecoveryDataFrame(streamID, seq, payload); err != nil {
+				c.debug.noteFailure(DebugFailureRecoveryData, "recovery data frame failed: "+err.Error())
 				c.markClosed()
 				return
 			}

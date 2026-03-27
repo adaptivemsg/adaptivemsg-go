@@ -93,6 +93,11 @@ func (c *Connection) writeFrameTo(conn io.Writer, streamID uint32, seq uint64, p
 	if err := writeFull(conn, payload); err != nil {
 		return err
 	}
+	c.debug.framesWritten.Add(1)
+	c.debug.bytesWritten.Add(uint64(len(header) + len(payload)))
+	if streamID == controlStreamID {
+		c.debug.controlFramesWritten.Add(1)
+	}
 	return nil
 }
 
@@ -119,6 +124,11 @@ func (c *Connection) readFrameFrom(conn io.Reader) (uint32, uint64, []byte, erro
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(conn, payload); err != nil {
 		return 0, 0, nil, err
+	}
+	c.debug.framesRead.Add(1)
+	c.debug.bytesRead.Add(uint64(len(header) + len(payload)))
+	if streamID == controlStreamID {
+		c.debug.controlFramesRead.Add(1)
 	}
 	return streamID, seq, payload, nil
 }

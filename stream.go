@@ -11,6 +11,7 @@ import (
 type streamCore struct {
 	id               uint32
 	connection       *Connection
+	debug            streamDebugCounters
 	inbox            chan rawMessage
 	incoming         chan []byte
 	handlerCh        chan handlerJob
@@ -18,6 +19,7 @@ type streamCore struct {
 	recvActive       atomic.Bool
 	peeked           rawMessage
 	hasPeeked        bool
+	closed           atomic.Bool
 	closeOnce        sync.Once
 }
 
@@ -95,14 +97,17 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	if raw.Wire == errorReplyWireName {
 		reply, err := decodeRawAs[*ErrorReply](raw)
 		if err != nil {
+			s.core.noteDecodeError(err)
 			s.core.protocolError("codec_error", err.Error())
 			return zero, err
 		}
+		s.core.noteRemoteError()
 		return zero, ErrRemote{Code: reply.Code, Message: reply.Message}
 	}
 	if isInterfaceType[T]() {
 		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
 		if err != nil {
+			s.core.noteDecodeError(err)
 			return zero, err
 		}
 		typed, ok := decoded.(T)
@@ -113,6 +118,7 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	}
 	typed, err := decodeRawAs[T](raw)
 	if err != nil {
+		s.core.noteDecodeError(err)
 		s.core.protocolErrorFor(err)
 		return zero, err
 	}
@@ -129,6 +135,7 @@ func (s *Stream[T]) Recv() (T, error) {
 	if isInterfaceType[T]() {
 		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
 		if err != nil {
+			s.core.noteDecodeError(err)
 			return zero, err
 		}
 		typed, ok := decoded.(T)
@@ -139,6 +146,7 @@ func (s *Stream[T]) Recv() (T, error) {
 	}
 	typed, err := decodeRawAs[T](raw)
 	if err != nil {
+		s.core.noteDecodeError(err)
 		s.core.protocolErrorFor(err)
 		return zero, err
 	}
@@ -176,6 +184,7 @@ func (s *streamCore) recvRaw() (rawMessage, error) {
 	if s.hasPeeked {
 		msg := s.peeked
 		s.hasPeeked = false
+		s.noteReceivedMessage()
 		return msg, nil
 	}
 	return s.readRaw()
@@ -215,6 +224,7 @@ func (s *streamCore) readRaw() (rawMessage, error) {
 			if !ok {
 				return rawMessage{}, ErrClosed{}
 			}
+			s.noteReceivedMessage()
 			return msg, nil
 		case <-s.connection.closeCh:
 			return rawMessage{}, ErrClosed{}
@@ -227,10 +237,13 @@ func (s *streamCore) readRaw() (rawMessage, error) {
 		if !ok {
 			return rawMessage{}, ErrClosed{}
 		}
+		s.noteReceivedMessage()
 		return msg, nil
 	case <-s.connection.closeCh:
 		return rawMessage{}, ErrClosed{}
 	case <-timer.C:
+		s.debug.noteFailure(DebugFailureStreamRecvTimeout, "recv timeout")
+		s.connection.debug.noteFailure(DebugFailureStreamRecvTimeout, "stream recv timeout")
 		return rawMessage{}, ErrRecvTimeout{}
 	}
 }
@@ -238,10 +251,19 @@ func (s *streamCore) readRaw() (rawMessage, error) {
 func (s *streamCore) sendBoxed(msg Message) error {
 	payload, err := s.connection.encodeMessage(msg)
 	if err != nil {
+		s.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
+		s.connection.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
 		return err
 	}
 	frame := outboundFrame{streamID: s.id, seq: s.connection.nextOutboundSeq(), payload: payload}
-	return s.connection.enqueueFrame(frame)
+	if err := s.connection.enqueueFrame(frame); err != nil {
+		s.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
+		s.connection.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
+		return err
+	}
+	s.debug.dataMessagesSent.Add(1)
+	s.connection.debug.dataMessagesSent.Add(1)
+	return nil
 }
 
 func (s *streamCore) inboxQ(msg rawMessage) (err error) {
@@ -292,8 +314,11 @@ func (s *streamCore) handlerQ(job handlerJob) (err error) {
 	}
 }
 
-func (s *streamCore) close() {
+func (s *streamCore) close() bool {
+	closed := false
 	s.closeOnce.Do(func() {
+		closed = true
+		s.closed.Store(true)
 		close(s.inbox)
 		if s.incoming != nil {
 			close(s.incoming)
@@ -302,14 +327,26 @@ func (s *streamCore) close() {
 			close(s.handlerCh)
 		}
 	})
+	return closed
 }
 
 func (s *streamCore) protocolError(code, message string) {
 	if code == "" {
 		code = "protocol_error"
 	}
+	reason := code
+	if message != "" {
+		reason += ": " + message
+	}
+	s.debug.noteFailure(DebugFailureStreamProtocol, reason)
+	s.connection.debug.noteFailure(DebugFailureStreamProtocol, "stream protocol error: "+reason)
+	s.debug.protocolErrors.Add(1)
+	s.connection.debug.protocolErrors.Add(1)
 	if err := s.sendBoxed(NewErrorReply(code, message)); err != nil {
-		protocolErrorReplySendFailures.Add(1)
+		s.debug.noteFailure(DebugFailureStreamProtocolReplySend, "protocol error reply send failed: "+err.Error())
+		s.connection.debug.noteFailure(DebugFailureStreamProtocolReplySend, "protocol error reply send failed: "+err.Error())
+		s.debug.protocolErrorReplySendFailure.Add(1)
+		s.connection.debug.protocolErrorReplySendFailure.Add(1)
 	}
 	s.connection.removeStream(s.id)
 }
@@ -344,8 +381,23 @@ func isInterfaceType[T any]() bool {
 
 var errorReplyWireName = expectedWireName[*ErrorReply]()
 
-var protocolErrorReplySendFailures atomic.Uint64
+func (s *streamCore) noteDecodeError(err error) {
+	reason := "decode failed"
+	if err != nil {
+		reason = "decode failed: " + err.Error()
+	}
+	s.debug.noteFailure(DebugFailureStreamDecode, reason)
+	s.connection.debug.noteFailure(DebugFailureStreamDecode, reason)
+	s.debug.decodeErrors.Add(1)
+	s.connection.debug.decodeErrors.Add(1)
+}
 
-func protocolErrorReplySendFailureCount() uint64 {
-	return protocolErrorReplySendFailures.Load()
+func (s *streamCore) noteRemoteError() {
+	s.debug.remoteErrors.Add(1)
+	s.connection.debug.remoteErrors.Add(1)
+}
+
+func (s *streamCore) noteReceivedMessage() {
+	s.debug.dataMessagesReceived.Add(1)
+	s.connection.debug.dataMessagesReceived.Add(1)
 }

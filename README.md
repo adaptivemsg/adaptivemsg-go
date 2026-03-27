@@ -190,3 +190,109 @@ Notes:
 
 For detailed recovery protocol behavior, heartbeat/liveness semantics, and
 cross-runtime interoperability notes, see `DEVELOP.md`.
+
+## Debugging and Observability
+
+The runtime exposes scoped debugging snapshots (per connection and per stream).
+This gives you counters and failure context without relying on global process
+metrics.
+
+### What is available
+
+- `Connection.DebugState()` returns:
+  - negotiated protocol/codec/max frame
+  - active stream count and per-stream snapshots
+  - per-connection counters (frames, bytes, messages, handler activity, recovery activity)
+  - last failure code, reason, and timestamp
+- `Stream[T].DebugState()` returns:
+  - stream queue depths and recv timeout
+  - per-stream counters
+  - stream-level last failure code, reason, and timestamp
+- Recovery-enabled connections also include `RecoveryDebugState` in the connection snapshot.
+
+### Typical usage pattern
+
+Use the snapshot where you handle transport/runtime errors so logs include both
+the immediate error and current runtime state:
+
+```go
+conn, err := client.Connect("tcp://127.0.0.1:5555")
+if err != nil {
+	log.Printf("connect failed: %v", err)
+	return
+}
+
+reply, err := am.SendRecvAs[*HelloReply](conn, &HelloRequest{Who: "alice"})
+if err != nil {
+	dbg := conn.DebugState()
+	// log.Printf("sendrecv failed: %+v", dbg)
+	log.Printf("sendrecv failed: err=%v code=%s reason=%s streams=%d sent=%d recv=%d",
+		err,
+		dbg.LastFailureCode,
+		dbg.LastFailure,
+		dbg.StreamCount,
+		dbg.Counters.DataMessagesSent,
+		dbg.Counters.DataMessagesReceived,
+	)
+	return
+}
+_ = reply
+```
+
+For a single stream:
+
+```go
+stream := conn.NewStream()
+_, err := am.StreamAs[*HelloReply](stream).Recv()
+if err != nil {
+	sdbg := stream.DebugState()
+	log.Printf("stream recv failed: err=%v stream=%d code=%s reason=%s inbox=%d incoming=%d",
+		err,
+		sdbg.ID,
+		sdbg.LastFailureCode,
+		sdbg.LastFailure,
+		sdbg.InboxDepth,
+		sdbg.IncomingDepth,
+	)
+}
+```
+
+### Failure codes
+
+Failure codes are stable strings intended for machine filtering/alerting while
+`LastFailure` remains human-readable context.
+
+Common codes include:
+
+- Stream path: `stream.recv_timeout`, `stream.encode`, `stream.enqueue`, `stream.decode`, `stream.protocol`, `stream.protocol_reply_send`
+- Connection path: `connection.reader`, `connection.writer`, `connection.reader_enqueue`, `handler.error`
+- Recovery path: `recovery.resume`, `recovery.reconnect_terminal`, `recovery.read`, `recovery.control`, `recovery.data`, `recovery.ack_write`, `recovery.resume_write`, `recovery.live_write`, `recovery.ping_write`
+
+### Troubleshooting quick map
+
+| Failure code | Likely cause | First checks |
+|---|---|---|
+| `stream.recv_timeout` | No message arrived before stream recv timeout | Check `SetRecvTimeout` value; verify peer is producing responses/events; inspect `InboxDepth` and `IncomingDepth` |
+| `stream.encode` | Local message cannot be encoded by negotiated codec | Validate message shape/tags; confirm codec supports payload type |
+| `stream.enqueue` | Connection is closing/closed or replay enqueue rejected | Check `ConnectionDebugState.Closed`; inspect replay limits and recent close reason |
+| `stream.decode` | Received payload cannot be decoded into expected type | Compare wire type versus expected type; verify registry/type registration order |
+| `stream.protocol` | Stream-level protocol violation detected | Inspect `LastFailure` detail and peer message ordering/type behavior |
+| `stream.protocol_reply_send` | Failed to send protocol `ErrorReply` after violation | Check transport health and whether connection was already closing |
+| `connection.reader` | Base frame read failed | Check network/transport health, frame compatibility, and max-frame settings |
+| `connection.writer` | Base frame write failed | Check peer reachability and connection lifecycle (`Closed`, detach/reconnect state) |
+| `connection.reader_enqueue` | Read frame could not be queued into stream pipeline | Check stream close timing and backpressure symptoms |
+| `handler.error` | Handler returned an application error | Inspect handler logs, input validation, and downstream dependencies |
+| `recovery.resume` | Resume attempt failed but may retry | Check server reachability, attach credentials, and reconnect backoff progression |
+| `recovery.reconnect_terminal` | Resume failed with terminal condition | Check reject reason (`LastFailure`), codec/version mismatch, connection existence |
+| `recovery.read` | Recovery transport read failed | Check heartbeat timeout behavior and transport blackhole symptoms |
+| `recovery.control` | Invalid recovery control frame payload/type | Verify non-Go peer control frame format and control type handling |
+| `recovery.data` | Recovery data frame sequencing/validation failed | Verify monotonic `seq` handling and replay logic |
+| `recovery.ack_write` / `recovery.ping_write` | Control frame write failed during recovery | Check transport stability during idle/control periods |
+| `recovery.resume_write` / `recovery.live_write` | Replay/live data write failed during recovery writer loop | Check transport churn and reconnect cadence |
+
+Recommended logging fields:
+
+- `last_failure_code`
+- `last_failure_reason`
+- `last_failure_at`
+- relevant scoped counters (for example `frames_read`, `frames_written`, `data_messages_sent`, `data_messages_received`)

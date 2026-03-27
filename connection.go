@@ -35,6 +35,7 @@ type Connection struct {
 	conn              net.Conn
 	registry          *registry
 	config            connConfig
+	debug             connectionDebugCounters
 	outbound          chan outboundFrame
 	sendNotify        chan struct{}
 	streams           map[uint32]*StreamContext
@@ -195,7 +196,9 @@ func (c *Connection) closeAllStreams() {
 	c.streams = make(map[uint32]*StreamContext)
 	c.streamsMu.Unlock()
 	for _, streamCtx := range streams {
-		streamCtx.stream.core.close()
+		if streamCtx.stream.core.close() {
+			c.debug.streamsClosed.Add(1)
+		}
 		if c.onCloseStream != nil {
 			c.onCloseStream(streamCtx)
 		}
@@ -210,7 +213,9 @@ func (c *Connection) removeStream(streamID uint32) {
 	if streamCtx == nil {
 		return
 	}
-	streamCtx.stream.core.close()
+	if streamCtx.stream.core.close() {
+		c.debug.streamsClosed.Add(1)
+	}
 	if c.onCloseStream != nil {
 		c.onCloseStream(streamCtx)
 	}
@@ -250,6 +255,7 @@ func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
 		stream: stream,
 	}
 	c.streams[streamID] = streamCtx
+	c.debug.streamsOpened.Add(1)
 	if handlerCh != nil {
 		go c.handlerLoop(streamCtx)
 	}
@@ -260,8 +266,14 @@ func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
 func (c *Connection) handlerLoop(streamCtx *StreamContext) {
 	core := streamCtx.stream.core
 	for job := range core.handlerCh {
+		core.debug.handlerCalls.Add(1)
+		c.debug.handlerCalls.Add(1)
 		reply, err := job.handler(streamCtx, job.msg)
 		if err != nil {
+			core.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
+			c.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
+			core.debug.handlerErrors.Add(1)
+			c.debug.handlerErrors.Add(1)
 			_ = core.sendBoxed(NewErrorReply("handler_error", err.Error()))
 			continue
 		}
@@ -283,10 +295,12 @@ func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 			}
 			raw, err := newRawMessageFromPayload(c.config.codecID, payload)
 			if err != nil {
+				core.noteDecodeError(err)
 				core.protocolError("codec_error", err.Error())
 				return
 			}
 			if err := c.dispatchMessage(core, raw); err != nil {
+				core.noteDecodeError(err)
 				core.protocolError("codec_error", err.Error())
 				return
 			}
@@ -330,6 +344,7 @@ func (c *Connection) writerLoop() {
 			return
 		case frame := <-c.outbound:
 			if err := c.writeFrame(frame.streamID, frame.seq, frame.payload); err != nil {
+				c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 				c.markClosed()
 				return
 			}
@@ -345,11 +360,13 @@ func (c *Connection) readerLoop() {
 	for {
 		streamID, _, payload, err := c.readFrame()
 		if err != nil {
+			c.debug.noteFailure(DebugFailureReaderLoop, "reader loop failed: "+err.Error())
 			c.markClosed()
 			return
 		}
 		streamCtx := c.getStreamCtx(streamID)
 		if err := streamCtx.stream.core.incomingQ(payload); err != nil {
+			c.debug.noteFailure(DebugFailureReaderEnqueue, "reader enqueue failed: "+err.Error())
 			c.markClosed()
 			return
 		}

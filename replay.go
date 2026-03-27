@@ -134,6 +134,24 @@ func (b *replayBuffer) bytesUsed() int64 {
 	return b.usedBytes
 }
 
+func (b *replayBuffer) bytesUsedLocked() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.usedBytes
+}
+
+func (b *replayBuffer) count() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.replayQueue)
+}
+
 func (b *replayBuffer) lastAckedSeq() uint64 {
 	if b == nil {
 		return 0
