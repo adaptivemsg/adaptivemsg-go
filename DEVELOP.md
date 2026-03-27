@@ -184,6 +184,37 @@ scope.
   differ from `v2`.
 - If either side does not support `v3`, they should continue using `v2`.
 
+### Protocol v2 vs v3 Performance Snapshot
+
+Measured with Go 1.22.10 on linux/amd64 using end-to-end SendRecv benchmarks:
+
+```bash
+go test -run=^$ -bench='BenchmarkProtocolV(2SendRecv|3RecoverySendRecv)$' -benchmem ./adaptivemsg-go
+```
+
+Latest measured result:
+
+- v2 baseline (no recovery/replay):
+  - `126042 ns/op`
+  - `2306 B/op`
+  - `64 allocs/op`
+- v3 recovery/replay enabled:
+  - `141751 ns/op`
+  - `2437 B/op`
+  - `66 allocs/op`
+
+Delta with v2 as baseline:
+
+- latency (`ns/op`): `+12.46%`
+- memory (`B/op`): `+5.68%`
+- allocations (`allocs/op`): `+3.12%`
+
+Interpretation:
+
+- `v3` adds measurable steady-state overhead versus `v2` due to recovery/replay
+  bookkeeping (sequence/ack and replay-path state), but it provides transport
+  break resilience that `v2` does not.
+
 ### Stale Connection Handling
 
 - If the client dies permanently, the server must not keep detached logical

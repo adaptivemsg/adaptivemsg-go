@@ -48,13 +48,12 @@ type recoveryState struct {
 	ackDelayNanos atomic.Int64
 	heartbeatIntv atomic.Int64
 	heartbeatTO   atomic.Int64
-	lastWriteUnix atomic.Int64
 	lastRecvSeq   uint64
 	lastAckSent   uint64
 	ackPending    uint32
 	ackDue        bool
+	ackDueAt      time.Time
 	pongDue       bool
-	ackTimerArmed bool
 	expireTimer   *time.Timer
 }
 
@@ -295,22 +294,17 @@ func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
 	ackEvery := r.ackEvery.Load()
 	if ackEvery <= 1 || r.ackPending >= ackEvery {
 		r.ackDue = true
+		r.ackDueAt = time.Time{}
 		notify = true
 	} else {
 		ackDelay := time.Duration(r.ackDelayNanos.Load())
 		if ackDelay <= 0 {
 			r.ackDue = true
+			r.ackDueAt = time.Time{}
 			notify = true
-		} else if !r.ackTimerArmed {
-			r.ackTimerArmed = true
-			go func() {
-				timer := time.NewTimer(ackDelay)
-				defer timer.Stop()
-				<-timer.C
-				if r.markAckDueAfterDelay() {
-					c.signalSend()
-				}
-			}()
+		} else if r.ackDueAt.IsZero() {
+			r.ackDueAt = time.Now().Add(ackDelay)
+			notify = true
 		}
 	}
 	r.mu.Unlock()
@@ -319,18 +313,20 @@ func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
 	}
 }
 
-func (r *recoveryState) markAckDueAfterDelay() bool {
+func (r *recoveryState) nextAckWait() time.Duration {
 	if r == nil {
-		return false
+		return 0
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ackTimerArmed = false
-	if r.lastAckSent < r.lastRecvSeq {
-		r.ackDue = true
-		return true
+	if r.ackDue || r.ackDueAt.IsZero() {
+		return 0
 	}
-	return false
+	wait := time.Until(r.ackDueAt)
+	if wait < 0 {
+		return 0
+	}
+	return wait
 }
 
 func (r *recoveryState) takePendingControl() (byte, uint64, bool) {
@@ -339,11 +335,15 @@ func (r *recoveryState) takePendingControl() (byte, uint64, bool) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if !r.ackDue && !r.ackDueAt.IsZero() && !time.Now().Before(r.ackDueAt) && r.lastAckSent < r.lastRecvSeq {
+		r.ackDue = true
+	}
 	if r.ackDue && r.lastAckSent < r.lastRecvSeq {
 		seq := r.lastRecvSeq
 		r.lastAckSent = seq
 		r.ackPending = 0
 		r.ackDue = false
+		r.ackDueAt = time.Time{}
 		return pendingControlAck, seq, true
 	}
 	if r.pongDue {
@@ -374,7 +374,6 @@ func (r *recoveryState) onAttached() {
 	r.expireTimer = nil
 	r.pongDue = false
 	r.mu.Unlock()
-	r.lastWriteUnix.Store(time.Now().UnixNano())
 	if timer != nil {
 		timer.Stop()
 	}
@@ -416,47 +415,6 @@ func (r *recoveryState) scheduleExpiry(c *Connection) {
 		}
 	})
 	r.mu.Unlock()
-}
-
-func (r *recoveryState) noteWrite() {
-	if r == nil {
-		return
-	}
-	r.lastWriteUnix.Store(time.Now().UnixNano())
-}
-
-func (r *recoveryState) nextHeartbeatWait() time.Duration {
-	if r == nil {
-		return 0
-	}
-	interval := time.Duration(r.heartbeatIntv.Load())
-	if interval <= 0 {
-		return 0
-	}
-	lastWrite := r.lastWriteUnix.Load()
-	if lastWrite == 0 {
-		return interval
-	}
-	wait := interval - time.Since(time.Unix(0, lastWrite))
-	if wait < 0 {
-		return 0
-	}
-	return wait
-}
-
-func (r *recoveryState) shouldSendPing() bool {
-	if r == nil {
-		return false
-	}
-	interval := time.Duration(r.heartbeatIntv.Load())
-	if interval <= 0 {
-		return false
-	}
-	lastWrite := r.lastWriteUnix.Load()
-	if lastWrite == 0 {
-		return true
-	}
-	return time.Since(time.Unix(0, lastWrite)) >= interval
 }
 
 func (r *recoveryState) queuePong() {
@@ -528,6 +486,20 @@ func (c *Connection) reconnectLoop() {
 
 func (c *Connection) recoveryWriterLoop() {
 	var lastGen uint64
+	var waitTimer *time.Timer
+	stopAndDrain := func() {
+		if !waitTimer.Stop() {
+			select {
+			case <-waitTimer.C:
+			default:
+			}
+		}
+	}
+	defer func() {
+		if waitTimer != nil {
+			stopAndDrain()
+		}
+	}()
 	for {
 		conn, gen, resumeSeq, err := c.waitForTransport(lastGen)
 		if err != nil {
@@ -550,7 +522,6 @@ func (c *Connection) recoveryWriterLoop() {
 					c.handleRecoveryTransportError(conn)
 					break
 				}
-				c.recovery.noteWrite()
 				continue
 			}
 			frame, ok := c.recovery.takeResumeFrame()
@@ -563,7 +534,6 @@ func (c *Connection) recoveryWriterLoop() {
 					break
 				}
 				lastSentSeq = frame.seq
-				c.recovery.noteWrite()
 				continue
 			}
 			frame, ok = c.recovery.takeLiveFrame()
@@ -576,19 +546,14 @@ func (c *Connection) recoveryWriterLoop() {
 					break
 				}
 				lastSentSeq = frame.seq
-				c.recovery.noteWrite()
 				continue
 			}
-			if c.recovery.shouldSendPing() {
-				if err := c.writeFrameTo(conn, controlStreamID, 0, buildPingControlPayload()); err != nil {
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-				c.recovery.noteWrite()
-				continue
+			ackWait := c.recovery.nextAckWait()
+			heartbeatWait := time.Duration(c.recovery.heartbeatIntv.Load())
+			wait := ackWait
+			if heartbeatWait > 0 && (ackWait <= 0 || heartbeatWait < ackWait) {
+				wait = heartbeatWait
 			}
-
-			wait := c.recovery.nextHeartbeatWait()
 			if wait <= 0 {
 				select {
 				case <-c.closeCh:
@@ -597,16 +562,27 @@ func (c *Connection) recoveryWriterLoop() {
 				}
 				continue
 			}
-			timer := time.NewTimer(wait)
+			if waitTimer == nil {
+				waitTimer = time.NewTimer(wait)
+			} else {
+				stopAndDrain()
+				waitTimer.Reset(wait)
+			}
+			timerFired := false
 			select {
 			case <-c.closeCh:
-				timer.Stop()
+				stopAndDrain()
 				return
 			case <-c.sendNotify:
-				if !timer.Stop() {
-					<-timer.C
+				stopAndDrain()
+			case <-waitTimer.C:
+				timerFired = true
+			}
+			if timerFired && wait == heartbeatWait {
+				if err := c.writeFrameTo(conn, controlStreamID, 0, buildPingControlPayload()); err != nil {
+					c.handleRecoveryTransportError(conn)
+					break
 				}
-			case <-timer.C:
 			}
 		}
 	}
