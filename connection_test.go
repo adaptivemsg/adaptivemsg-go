@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -59,7 +60,7 @@ func TestConnectionBuildHeaderTooLarge(t *testing.T) {
 			maxFrame: 4,
 		},
 	}
-	_, err := conn.buildHeader(1, 0, 5)
+	_, _, err := conn.buildHeader(1, 0, 5)
 	var tooLarge ErrFrameTooLarge
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
@@ -160,8 +161,9 @@ func TestConnectionWriteFrameShortWrite(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
+	shortConn := &shortWriteConn{Conn: clientConn, maxWrite: 3}
 	writer := &Connection{
-		conn: &shortWriteConn{Conn: clientConn, maxWrite: 3},
+		conn: shortConn,
 		config: connConfig{
 			version:  protocolVersion,
 			maxFrame: defaultMaxFrame,
@@ -198,8 +200,9 @@ func TestConnectionWriteFrameShortWrite(t *testing.T) {
 		errCh <- nil
 	}()
 
-	if err := writer.writeFrame(7, 0, payload); err != nil {
-		t.Fatalf("writeFrame: %v", err)
+	// Use writeFrameTo directly with the short-write conn to test writeFull retry logic.
+	if err := writer.writeFrameTo(shortConn, 7, 0, payload); err != nil {
+		t.Fatalf("writeFrameTo: %v", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("readFrame: %v", err)
@@ -218,6 +221,7 @@ func TestConnectionWriteReadFrameV3(t *testing.T) {
 			maxFrame: defaultMaxFrame,
 		},
 	}
+	writer.writer = bufio.NewWriter(writer.conn)
 	reader := &Connection{
 		conn: serverConn,
 		config: connConfig{

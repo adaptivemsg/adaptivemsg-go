@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"bufio"
 	"errors"
 	"net"
 	"sync"
@@ -139,6 +140,7 @@ func (c *Connection) attachTransport(conn net.Conn, peerLastRecvSeq uint64) {
 	c.transportMu.Lock()
 	oldConn := c.conn
 	c.conn = conn
+	c.writer = bufio.NewWriter(conn)
 	c.transportGen++
 	c.transportResume = peerLastRecvSeq
 	c.transportMu.Unlock()
@@ -163,6 +165,7 @@ func (c *Connection) detachTransport(conn net.Conn) bool {
 		return false
 	}
 	c.conn = nil
+	c.writer = nil
 	c.transportGen++
 	c.transportResume = 0
 	c.transportMu.Unlock()
@@ -184,6 +187,7 @@ func (c *Connection) closeTransport() {
 	c.transportMu.Lock()
 	conn := c.conn
 	c.conn = nil
+	c.writer = nil
 	c.transportGen++
 	c.transportResume = 0
 	c.transportMu.Unlock()
@@ -499,6 +503,7 @@ func (c *Connection) recoveryWriterLoop() {
 		lastGen = gen
 		lastSentSeq := resumeSeq
 		c.recovery.prepareResume(resumeSeq)
+		bw := bufio.NewWriter(conn)
 
 		for {
 			if !c.transportActive(gen, conn) {
@@ -506,8 +511,22 @@ func (c *Connection) recoveryWriterLoop() {
 			}
 			if _, ackSeq, ok := c.recovery.takePendingControl(); ok {
 				payload := buildAckControlPayload(ackSeq)
-				if err := c.writeFrameTo(conn, controlStreamID, 0, payload); err != nil {
+				if err := c.writeFrameNoFlush(bw, controlStreamID, 0, payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery ack write failed: "+err.Error())
+					c.handleRecoveryTransportError(conn)
+					break
+				}
+				// Batch: also write a pending live frame before flushing
+				if frame, ok := c.recovery.takeLiveFrame(); ok && frame.seq > lastSentSeq {
+					if err := c.writeFrameNoFlush(bw, frame.streamID, frame.seq, frame.payload); err != nil {
+						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
+						c.handleRecoveryTransportError(conn)
+						break
+					}
+					lastSentSeq = frame.seq
+				}
+				if err := bw.Flush(); err != nil {
+					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery flush failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
@@ -518,7 +537,7 @@ func (c *Connection) recoveryWriterLoop() {
 				if frame.seq <= lastSentSeq || frame.seq <= c.recovery.replay.lastAckedSeq() {
 					continue
 				}
-				if err := c.writeFrameTo(conn, frame.streamID, frame.seq, frame.payload); err != nil {
+				if err := c.writeFrameTo(bw, frame.streamID, frame.seq, frame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryResumeWrite, "recovery resume write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -531,7 +550,7 @@ func (c *Connection) recoveryWriterLoop() {
 				if frame.seq <= lastSentSeq {
 					continue
 				}
-				if err := c.writeFrameTo(conn, frame.streamID, frame.seq, frame.payload); err != nil {
+				if err := c.writeFrameTo(bw, frame.streamID, frame.seq, frame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -570,7 +589,7 @@ func (c *Connection) recoveryWriterLoop() {
 				timerFired = true
 			}
 			if timerFired && wait == heartbeatWait {
-				if err := c.writeFrameTo(conn, controlStreamID, 0, buildPingControlPayload()); err != nil {
+				if err := c.writeFrameTo(bw, controlStreamID, 0, buildPingControlPayload()); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryPingWrite, "recovery ping write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break

@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"bufio"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,7 @@ type handlerJob struct {
 // Connection is a live session and also acts as the default stream.
 type Connection struct {
 	conn              net.Conn
+	writer            *bufio.Writer
 	registry          *registry
 	config            connConfig
 	debug             connectionDebugCounters
@@ -67,6 +69,7 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 	}
 	connection := &Connection{
 		conn:          conn,
+		writer:        bufio.NewWriter(conn),
 		registry:      registry,
 		outbound:      make(chan outboundFrame, streamQueueSize),
 		sendNotify:    make(chan struct{}, 1),

@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
 )
@@ -35,18 +36,18 @@ func frameHeaderLenForVersion(version byte) (int, error) {
 	}
 }
 
-func (c *Connection) buildHeader(streamID uint32, seq uint64, payloadLen int) ([]byte, error) {
+func (c *Connection) buildHeader(streamID uint32, seq uint64, payloadLen int) ([frameHeaderLenV3]byte, int, error) {
 	if payloadLen > int(^uint32(0)) {
-		return nil, ErrFrameTooLarge{Size: payloadLen}
+		return [frameHeaderLenV3]byte{}, 0, ErrFrameTooLarge{Size: payloadLen}
 	}
 	if uint32(payloadLen) > c.config.maxFrame {
-		return nil, ErrFrameTooLarge{Size: payloadLen}
+		return [frameHeaderLenV3]byte{}, 0, ErrFrameTooLarge{Size: payloadLen}
 	}
 	headerLen, err := frameHeaderLenForVersion(c.config.version)
 	if err != nil {
-		return nil, err
+		return [frameHeaderLenV3]byte{}, 0, err
 	}
-	header := make([]byte, headerLen)
+	var header [frameHeaderLenV3]byte
 	header[0] = c.config.version
 	header[1] = 0
 	binary.BigEndian.PutUint32(header[2:6], streamID)
@@ -54,7 +55,7 @@ func (c *Connection) buildHeader(streamID uint32, seq uint64, payloadLen int) ([
 	if c.config.version == protocolVersionV3 {
 		binary.BigEndian.PutUint64(header[10:18], seq)
 	}
-	return header, nil
+	return header, headerLen, nil
 }
 
 func (c *Connection) parseHeader(header []byte) (uint32, uint64, int, error) {
@@ -79,22 +80,46 @@ func (c *Connection) parseHeader(header []byte) (uint32, uint64, int, error) {
 }
 
 func (c *Connection) writeFrame(streamID uint32, seq uint64, payload []byte) error {
-	return c.writeFrameTo(c.conn, streamID, seq, payload)
+	return c.writeFrameTo(c.writer, streamID, seq, payload)
 }
 
 func (c *Connection) writeFrameTo(conn io.Writer, streamID uint32, seq uint64, payload []byte) error {
-	header, err := c.buildHeader(streamID, seq, len(payload))
+	header, headerLen, err := c.buildHeader(streamID, seq, len(payload))
 	if err != nil {
 		return err
 	}
-	if err := writeFull(conn, header); err != nil {
+	if err := writeFull(conn, header[:headerLen]); err != nil {
 		return err
 	}
 	if err := writeFull(conn, payload); err != nil {
 		return err
 	}
 	c.debug.framesWritten.Add(1)
-	c.debug.bytesWritten.Add(uint64(len(header) + len(payload)))
+	c.debug.bytesWritten.Add(uint64(headerLen + len(payload)))
+	if streamID == controlStreamID {
+		c.debug.controlFramesWritten.Add(1)
+	}
+	// Flush if the writer supports it (buffered writer).
+	if bw, ok := conn.(*bufio.Writer); ok {
+		return bw.Flush()
+	}
+	return nil
+}
+
+// writeFrameNoFlush writes a frame without flushing, for batching multiple writes.
+func (c *Connection) writeFrameNoFlush(conn io.Writer, streamID uint32, seq uint64, payload []byte) error {
+	header, headerLen, err := c.buildHeader(streamID, seq, len(payload))
+	if err != nil {
+		return err
+	}
+	if err := writeFull(conn, header[:headerLen]); err != nil {
+		return err
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return err
+	}
+	c.debug.framesWritten.Add(1)
+	c.debug.bytesWritten.Add(uint64(headerLen + len(payload)))
 	if streamID == controlStreamID {
 		c.debug.controlFramesWritten.Add(1)
 	}
@@ -110,11 +135,11 @@ func (c *Connection) readFrameFrom(conn io.Reader) (uint32, uint64, []byte, erro
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	header := make([]byte, headerLen)
-	if _, err := io.ReadFull(conn, header); err != nil {
+	var header [frameHeaderLenV3]byte
+	if _, err := io.ReadFull(conn, header[:headerLen]); err != nil {
 		return 0, 0, nil, err
 	}
-	streamID, seq, payloadLen, err := c.parseHeader(header)
+	streamID, seq, payloadLen, err := c.parseHeader(header[:headerLen])
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -126,7 +151,7 @@ func (c *Connection) readFrameFrom(conn io.Reader) (uint32, uint64, []byte, erro
 		return 0, 0, nil, err
 	}
 	c.debug.framesRead.Add(1)
-	c.debug.bytesRead.Add(uint64(len(header) + len(payload)))
+	c.debug.bytesRead.Add(uint64(headerLen + len(payload)))
 	if streamID == controlStreamID {
 		c.debug.controlFramesRead.Add(1)
 	}
