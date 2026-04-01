@@ -166,6 +166,26 @@ func (e ErrInvalidMessage) Error() string {
 	return e.Reason
 }
 
+// ErrHandshakeRejected indicates the peer explicitly rejected the handshake.
+type ErrHandshakeRejected struct{}
+
+func (e ErrHandshakeRejected) Error() string {
+	return "handshake rejected"
+}
+
+// ErrNoCommonVersion indicates no protocol version overlap between client and server.
+type ErrNoCommonVersion struct {
+	ClientMin byte
+	ClientMax byte
+	ServerMin byte
+	ServerMax byte
+}
+
+func (e ErrNoCommonVersion) Error() string {
+	return fmt.Sprintf("no common protocol version: client %d-%d, server %d-%d",
+		e.ClientMin, e.ClientMax, e.ServerMin, e.ServerMax)
+}
+
 // ErrUnsupportedTransport indicates a transport feature is unavailable.
 type ErrUnsupportedTransport struct {
 	Reason string

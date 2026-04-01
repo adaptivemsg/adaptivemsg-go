@@ -61,7 +61,7 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version b
 		return connConfig{}, ErrUnsupportedFrameVersion{Version: replyVersion}
 	}
 	if accept == 0 {
-		return connConfig{}, ErrNoCommonCodec{}
+		return connConfig{}, ErrHandshakeRejected{}
 	}
 	if !containsCodec(codecs, selected) {
 		return connConfig{}, ErrNoCommonCodec{}

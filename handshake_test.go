@@ -159,9 +159,9 @@ func TestHandshakeClientRejected(t *testing.T) {
 	}()
 
 	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV2)
-	var noCommon ErrNoCommonCodec
-	if !errors.As(err, &noCommon) {
-		t.Fatalf("expected ErrNoCommonCodec, got %v", err)
+	var rejected ErrHandshakeRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("expected ErrHandshakeRejected, got %v", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("server write: %v", err)
