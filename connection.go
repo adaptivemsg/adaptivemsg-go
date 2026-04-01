@@ -216,6 +216,10 @@ func (c *Connection) removeStream(streamID uint32) {
 	if streamCtx == nil {
 		return
 	}
+	// Promote stream failure to connection so it survives stream removal.
+	if code := streamCtx.stream.core.debug.lastFailureCode(); code != DebugFailureNone {
+		c.debug.noteFailure(code, streamCtx.stream.core.debug.lastFailureReason())
+	}
 	if streamCtx.stream.core.close() {
 		c.debug.streamsClosed.Add(1)
 	}
