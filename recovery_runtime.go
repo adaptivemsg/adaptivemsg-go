@@ -39,7 +39,6 @@ type recoveryState struct {
 
 	reconnectActive atomic.Bool
 
-	liveQueue   *frameDeque
 	resumeQueue *frameDeque
 
 	mu            sync.Mutex
@@ -67,7 +66,6 @@ func newClientRecoveryState(opts ClientRecoveryOptions, negotiated negotiatedRec
 		connectionID:        connectionID,
 		resumeSecret:        resumeSecret,
 		replay:              newReplayBuffer(protocolVersionV3, normalized.MaxReplayBytes),
-		liveQueue:           newFrameDeque(),
 		resumeQueue:         newFrameDeque(),
 	}
 	state.setNegotiated(negotiated)
@@ -83,7 +81,6 @@ func newServerRecoveryState(opts ServerRecoveryOptions, server *Server, connecti
 		connectionID: connectionID,
 		resumeSecret: resumeSecret,
 		replay:       newReplayBuffer(protocolVersionV3, normalized.MaxReplayBytes),
-		liveQueue:    newFrameDeque(),
 		resumeQueue:  newFrameDeque(),
 	}
 	state.setNegotiated(normalized.negotiated())
@@ -249,13 +246,6 @@ func (r *recoveryState) setNegotiated(opts negotiatedRecoveryOptions) {
 	r.heartbeatTO.Store(int64(normalized.HeartbeatTimeout))
 }
 
-func (r *recoveryState) enqueueLive(frame *frameRecord) {
-	if r == nil {
-		return
-	}
-	r.liveQueue.push(frame)
-}
-
 func (r *recoveryState) prepareResume(lastSeq uint64) {
 	if r == nil {
 		return
@@ -269,13 +259,6 @@ func (r *recoveryState) takeResumeFrame() (*frameRecord, bool) {
 		return nil, false
 	}
 	return r.resumeQueue.pop()
-}
-
-func (r *recoveryState) takeLiveFrame() (*frameRecord, bool) {
-	if r == nil {
-		return nil, false
-	}
-	return r.liveQueue.pop()
 }
 
 func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
@@ -482,6 +465,18 @@ func (c *Connection) reconnectLoop() {
 func (c *Connection) recoveryWriterLoop() {
 	var lastGen uint64
 	var waitTimer *time.Timer
+	stageLive := func(frame outboundFrame) (*frameRecord, bool) {
+		frame.seq = c.nextOutboundSeq()
+		record, err := c.recovery.replay.add(frame)
+		if frame.queued != nil {
+			frame.queued <- err
+		}
+		if err != nil {
+			c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live queue failed: "+err.Error())
+			return nil, false
+		}
+		return record, true
+	}
 	stopAndDrain := func() {
 		if !waitTimer.Stop() {
 			select {
@@ -506,6 +501,7 @@ func (c *Connection) recoveryWriterLoop() {
 		bw := bufio.NewWriter(conn)
 
 		for {
+			lostTransport := false
 			if !c.transportActive(gen, conn) {
 				break
 			}
@@ -517,13 +513,22 @@ func (c *Connection) recoveryWriterLoop() {
 					break
 				}
 				// Batch: also write a pending live frame before flushing
-				if frame, ok := c.recovery.takeLiveFrame(); ok && frame.seq > lastSentSeq {
-					if err := c.writeFrameNoFlush(bw, frame.streamID, frame.seq, frame.payload); err != nil {
-						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-						c.handleRecoveryTransportError(conn)
-						break
+				select {
+				case frame := <-c.outbound:
+					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
+						if err := c.writeFrameNoFlush(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
+							c.handleRecoveryTransportError(conn)
+							lostTransport = true
+						}
+						if !lostTransport {
+							lastSentSeq = stored.seq
+						}
 					}
-					lastSentSeq = frame.seq
+				default:
+				}
+				if lostTransport {
+					break
 				}
 				if err := bw.Flush(); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery flush failed: "+err.Error())
@@ -532,30 +537,39 @@ func (c *Connection) recoveryWriterLoop() {
 				}
 				continue
 			}
-			frame, ok := c.recovery.takeResumeFrame()
+			resumeFrame, ok := c.recovery.takeResumeFrame()
 			if ok {
-				if frame.seq <= lastSentSeq || frame.seq <= c.recovery.replay.lastAckedSeq() {
+				if resumeFrame.seq <= lastSentSeq || resumeFrame.seq <= c.recovery.replay.lastAckedSeq() {
 					continue
 				}
-				if err := c.writeFrameTo(bw, frame.streamID, frame.seq, frame.payload); err != nil {
+				if err := c.writeFrameTo(bw, resumeFrame.streamID, resumeFrame.seq, resumeFrame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryResumeWrite, "recovery resume write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
-				lastSentSeq = frame.seq
+				lastSentSeq = resumeFrame.seq
 				continue
 			}
-			frame, ok = c.recovery.takeLiveFrame()
-			if ok {
-				if frame.seq <= lastSentSeq {
+			var frame outboundFrame
+			select {
+			case frame = <-c.outbound:
+			default:
+				frame = outboundFrame{}
+			}
+			if frame.payload != nil {
+				stored, ok := stageLive(frame)
+				if !ok {
 					continue
 				}
-				if err := c.writeFrameTo(bw, frame.streamID, frame.seq, frame.payload); err != nil {
+				if stored.seq <= lastSentSeq {
+					continue
+				}
+				if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
 				}
-				lastSentSeq = frame.seq
+				lastSentSeq = stored.seq
 				continue
 			}
 			ackWait := c.recovery.nextAckWait()
@@ -569,6 +583,20 @@ func (c *Connection) recoveryWriterLoop() {
 				case <-c.closeCh:
 					return
 				case <-c.sendNotify:
+				case frame := <-c.outbound:
+					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
+						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
+							c.handleRecoveryTransportError(conn)
+							lostTransport = true
+						}
+						if !lostTransport {
+							lastSentSeq = stored.seq
+						}
+					}
+				}
+				if lostTransport {
+					break
 				}
 				continue
 			}
@@ -585,8 +613,23 @@ func (c *Connection) recoveryWriterLoop() {
 				return
 			case <-c.sendNotify:
 				stopAndDrain()
+			case frame := <-c.outbound:
+				stopAndDrain()
+				if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
+					if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
+						c.handleRecoveryTransportError(conn)
+						lostTransport = true
+					}
+					if !lostTransport {
+						lastSentSeq = stored.seq
+					}
+				}
 			case <-waitTimer.C:
 				timerFired = true
+			}
+			if lostTransport {
+				break
 			}
 			if timerFired && wait == heartbeatWait {
 				if err := c.writeFrameTo(bw, controlStreamID, 0, buildPingControlPayload()); err != nil {

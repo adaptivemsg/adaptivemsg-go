@@ -298,7 +298,7 @@ func (r *recoveryState) debugState(c *Connection) RecoveryDebugState {
 		HeartbeatTimeout:  time.Duration(r.heartbeatTO.Load()),
 		ReplayQueued:      r.replay.count(),
 		ReplayBytes:       r.replay.bytesUsedLocked(),
-		LiveQueueDepth:    r.liveQueue.len(),
+		LiveQueueDepth:    0,
 		ResumeQueueDepth:  r.resumeQueue.len(),
 	}
 }

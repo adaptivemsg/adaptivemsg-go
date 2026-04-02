@@ -24,6 +24,7 @@ type outboundFrame struct {
 	streamID uint32
 	seq      uint64
 	payload  []byte
+	queued   chan error
 }
 
 type handlerJob struct {
@@ -389,13 +390,15 @@ func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {
 	if c.isRecoveryEnabled() {
-		stored, err := c.recovery.replay.add(frame)
-		if err != nil {
-			return err
+		frame.seq = 0
+		frame.queued = make(chan error, 1)
+		select {
+		case <-c.closeCh:
+			return ErrClosed{}
+		case c.outbound <- frame:
 		}
-		c.recovery.enqueueLive(stored)
 		c.signalSend()
-		return nil
+		return <-frame.queued
 	}
 	select {
 	case <-c.closeCh:

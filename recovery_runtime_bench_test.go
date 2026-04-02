@@ -10,7 +10,6 @@ func benchRecoveryState() *recoveryState {
 	state := &recoveryState{
 		role:        recoveryRoleClient,
 		replay:      newReplayBuffer(protocolVersionV3, 1<<20),
-		liveQueue:   newFrameDeque(),
 		resumeQueue: newFrameDeque(),
 	}
 	state.setNegotiated(defaultServerRecoveryOptions().negotiated())

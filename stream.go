@@ -255,7 +255,7 @@ func (s *streamCore) sendBoxed(msg Message) error {
 		s.connection.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
 		return err
 	}
-	frame := outboundFrame{streamID: s.id, seq: s.connection.nextOutboundSeq(), payload: payload}
+	frame := outboundFrame{streamID: s.id, payload: payload}
 	if err := s.connection.enqueueFrame(frame); err != nil {
 		s.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
 		s.connection.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
