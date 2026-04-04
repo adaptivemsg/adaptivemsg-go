@@ -1,4 +1,4 @@
-//go:generate go run ../../cmd/amgen-go
+//go:generate go run github.com/adaptivemsg/adaptivemsg-go/cmd/amgen-go
 
 package hello
 

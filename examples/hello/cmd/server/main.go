@@ -4,8 +4,8 @@ import (
 	"flag"
 	"log"
 
-	am "adaptivemsg"
-	_ "adaptivemsg/examples/hello"
+	am "github.com/adaptivemsg/adaptivemsg-go"
+	_ "github.com/adaptivemsg/adaptivemsg-go/examples/hello"
 )
 
 func main() {

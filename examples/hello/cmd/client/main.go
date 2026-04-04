@@ -6,8 +6,8 @@ import (
 	"log"
 	"sync"
 
-	am "adaptivemsg"
-	"adaptivemsg/examples/hello"
+	am "github.com/adaptivemsg/adaptivemsg-go"
+	"github.com/adaptivemsg/adaptivemsg-go/examples/hello"
 )
 
 func main() {

@@ -97,7 +97,7 @@ func defaultWireNameForType(ns string, t reflect.Type) (string, error) {
 	leaf := "unknown"
 	if pkgPath != "" {
 		parts := strings.Split(pkgPath, "/")
-		leaf = parts[len(parts)-1]
+		leaf = strings.TrimSuffix(parts[len(parts)-1], "-go")
 	}
 	name := t.Name()
 	if name == "" {

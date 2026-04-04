@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	am "adaptivemsg"
+	am "github.com/adaptivemsg/adaptivemsg-go"
 )
 
 func (msg *MessageRequest) Handle(ctx *am.StreamContext) (am.Message, error) {

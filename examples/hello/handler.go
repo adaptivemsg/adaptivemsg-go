@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	am "adaptivemsg"
+	am "github.com/adaptivemsg/adaptivemsg-go"
 )
 
 func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {

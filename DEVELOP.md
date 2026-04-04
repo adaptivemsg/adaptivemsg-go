@@ -434,7 +434,7 @@ Replay on resume:
 Measured with Go 1.22.10 on linux/amd64:
 
 ```bash
-go test -run=^$ -bench='BenchmarkProtocolV(2SendRecv|3RecoverySendRecv)$' -benchmem ./adaptivemsg-go
+go test -run=^$ -bench='BenchmarkProtocolV(2SendRecv|3RecoverySendRecv)$' -benchmem .
 ```
 
 Latest measured result:
