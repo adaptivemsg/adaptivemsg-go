@@ -347,15 +347,36 @@ func (c *Connection) writerLoop() {
 		return
 	}
 	for {
+		// Block until at least one frame is available.
 		select {
 		case <-c.closeCh:
 			return
 		case frame := <-c.outbound:
-			if err := c.writeFrame(frame.streamID, frame.seq, frame.payload); err != nil {
+			if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.payload); err != nil {
 				c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 				c.markClosed()
 				return
 			}
+		}
+		// Drain any queued frames without blocking.
+		drain := true
+		for drain {
+			select {
+			case frame := <-c.outbound:
+				if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.payload); err != nil {
+					c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
+					c.markClosed()
+					return
+				}
+			default:
+				drain = false
+			}
+		}
+		// Flush once for the entire batch.
+		if err := c.writer.Flush(); err != nil {
+			c.debug.noteFailure(DebugFailureWriterLoop, "writer flush failed: "+err.Error())
+			c.markClosed()
+			return
 		}
 	}
 }
