@@ -30,17 +30,17 @@ func main() {
 
 	goFile := strings.TrimSpace(os.Getenv("GOFILE"))
 	if goFile == "" {
-        fmt.Fprintln(os.Stderr, "amgen-go: GOFILE is not set; run via go generate")
+		fmt.Fprintln(os.Stderr, "amgen-go: GOFILE is not set; run via go generate")
 		os.Exit(1)
 	}
 	if !strings.HasSuffix(goFile, ".go") {
-        fmt.Fprintf(os.Stderr, "amgen-go: GOFILE must be a .go file, got %q\n", goFile)
+		fmt.Fprintf(os.Stderr, "amgen-go: GOFILE must be a .go file, got %q\n", goFile)
 		os.Exit(1)
 	}
 	inputValue := goFile
 	outValue := strings.TrimSuffix(goFile, ".go") + ".rs"
 	if err := run(inputValue, outValue); err != nil {
-        fmt.Fprintf(os.Stderr, "amgen-go: %v\n", err)
+		fmt.Fprintf(os.Stderr, "amgen-go: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -171,15 +171,8 @@ func writeRootCargo(repoRoot, crateName, libPath string) error {
 func checkRootCargo(repoRoot, crateName, libPath string) (bool, error) {
 	cargoPath := filepath.Join(repoRoot, "Cargo.toml")
 	if _, err := os.Stat(cargoPath); err == nil {
-		existing, err := os.ReadFile(cargoPath)
-		if err != nil {
-			return false, err
-		}
-		expected := renderRootCargo(crateName, libPath)
-		if strings.TrimSpace(string(existing)) == strings.TrimSpace(expected) {
-			return false, nil
-		}
-		return false, fmt.Errorf("Cargo.toml already exists at %s", cargoPath)
+		// Cargo.toml already exists; leave it as-is.
+		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
