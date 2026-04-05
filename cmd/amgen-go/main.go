@@ -112,7 +112,8 @@ func run(input, out string) error {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return fmt.Errorf("output must be inside repo root %s", repoRoot)
 	}
-	needCargo, err := checkRootCargo(repoRoot, file.Name.Name, "lib.rs")
+	repoName := filepath.Base(repoRoot)
+	needCargo, err := checkRootCargo(repoRoot, repoName, "lib.rs")
 	if err != nil {
 		return err
 	}
@@ -137,7 +138,7 @@ func run(input, out string) error {
 	}
 
 	if needCargo {
-		return writeRootCargo(repoRoot, file.Name.Name, "lib.rs")
+		return writeRootCargo(repoRoot, repoName, "lib.rs")
 	}
 	return nil
 }
@@ -197,6 +198,13 @@ func findGoModRoot(start string) (string, error) {
 }
 
 func renderRootCargo(crateName, libPath string) string {
+	// Derive lib name: strip language suffix, replace hyphens with underscores.
+	libName := crateName
+	for _, suffix := range []string{"-go", "-rust"} {
+		libName = strings.TrimSuffix(libName, suffix)
+	}
+	libName = strings.ReplaceAll(libName, "-", "_")
+
 	var buf bytes.Buffer
 	writeLine(&buf, 0, "[package]")
 	writeLine(&buf, 0, fmt.Sprintf("name = %q", crateName))
@@ -204,13 +212,12 @@ func renderRootCargo(crateName, libPath string) string {
 	writeLine(&buf, 0, "edition = \"2021\"")
 	writeLine(&buf, 0, "")
 	writeLine(&buf, 0, "[lib]")
+	writeLine(&buf, 0, fmt.Sprintf("name = %q", libName))
 	writeLine(&buf, 0, fmt.Sprintf("path = %q", libPath))
 	writeLine(&buf, 0, "")
 	writeLine(&buf, 0, "[dependencies]")
 	writeLine(&buf, 0, "serde = { version = \"1.0\", features = [\"derive\"] }")
-	writeLine(&buf, 0, "# adaptivemsg = { path = \"...\" }")
-	writeLine(&buf, 0, "")
-	writeLine(&buf, 0, "# TODO: set a real version and adaptivemsg dependency before publishing.")
+	writeLine(&buf, 0, "adaptivemsg = { git = \"https://github.com/adaptivemsg/adaptivemsg-rust.git\" }")
 	return buf.String()
 }
 
