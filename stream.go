@@ -32,37 +32,14 @@ type viewCoreProvider interface {
 	viewCore() *streamCore
 }
 
-// StreamAs returns a typed Stream view for a stream provider.
-func StreamAs[T any](v viewCoreProvider) *Stream[T] {
-	if v == nil {
-		return nil
-	}
-	if stream, ok := v.(*Stream[T]); ok {
-		return stream
-	}
-	core := v.viewCore()
-	if core == nil {
-		return nil
-	}
-	return &Stream[T]{core: core}
-}
-
-// SendRecvAs sends a message and receives a typed reply on a stream provider.
-func SendRecvAs[T any](v viewCoreProvider, msg Message) (T, error) {
-	var zero T
-	stream := StreamAs[T](v)
-	if stream == nil {
-		return zero, ErrInvalidMessage{Reason: "stream view is nil"}
-	}
-	return stream.SendRecv(msg)
-}
-
 func (s *Stream[T]) viewCore() *streamCore {
 	if s == nil {
 		return nil
 	}
 	return s.core
 }
+
+func (*Stream[T]) isLink() {}
 
 // ID returns the stream ID.
 func (s *Stream[T]) ID() uint32 {

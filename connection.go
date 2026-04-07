@@ -164,6 +164,8 @@ func (c *Connection) viewCore() *streamCore {
 	return c.defaultStream().core
 }
 
+func (*Connection) isLink() {}
+
 func (c *Connection) streamForID(streamID uint32) *streamCore {
 	streamCtx := c.getStreamCtx(streamID)
 	return streamCtx.stream.core
