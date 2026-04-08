@@ -2,25 +2,48 @@ package adaptivemsg
 
 import "time"
 
-// ClientRecoveryOptions controls client-local recovery behavior.
+// ClientRecoveryOptions controls client-side recovery behavior for automatic
+// reconnect and replay. When Enable is true, the client negotiates the v3
+// protocol with the server, enabling transparent reconnection and message
+// replay after transient network failures.
 type ClientRecoveryOptions struct {
-	Enable              bool
+	// Enable activates recovery mode. Default: false.
+	Enable bool
+	// ReconnectMinBackoff is the minimum backoff duration between reconnect
+	// attempts. Default: 100ms.
 	ReconnectMinBackoff time.Duration
+	// ReconnectMaxBackoff is the maximum backoff duration between reconnect
+	// attempts. Default: 2s.
 	ReconnectMaxBackoff time.Duration
-	MaxReplayBytes      int64
+	// MaxReplayBytes is the maximum number of bytes buffered for replay of
+	// unacknowledged messages. Default: 8 MiB.
+	MaxReplayBytes int64
 }
 
-// ServerRecoveryOptions controls server recovery behavior.
-// ACK and heartbeat fields are authoritative for the connection and are sent to
-// the client during attach/resume.
+// ServerRecoveryOptions controls server-side recovery behavior for connection
+// retention and ACK policy. When Enable is true, the server supports the v3
+// protocol with attach/resume semantics. ACK and heartbeat fields are
+// authoritative for the connection and are sent to the client during
+// attach/resume.
 type ServerRecoveryOptions struct {
-	Enable            bool
-	DetachedTTL       time.Duration
-	MaxReplayBytes    int64
-	AckEvery          uint32
-	AckDelay          time.Duration
+	// Enable activates recovery mode. Default: false.
+	Enable bool
+	// DetachedTTL is how long the server retains a detached connection's state
+	// before discarding it. Default: 30s.
+	DetachedTTL time.Duration
+	// MaxReplayBytes is the maximum number of bytes buffered for replay of
+	// unacknowledged messages. Default: 8 MiB.
+	MaxReplayBytes int64
+	// AckEvery sends a cumulative ACK every N data frames. Default: 64.
+	AckEvery uint32
+	// AckDelay is the delay before flushing a pending ACK. Default: 20ms.
+	AckDelay time.Duration
+	// HeartbeatInterval is the interval between heartbeat pings when the
+	// connection is idle. Default: 30s.
 	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
+	// HeartbeatTimeout closes the connection if no inbound frame is received
+	// within this duration. Must be ≥ 2×HeartbeatInterval. Default: 90s.
+	HeartbeatTimeout time.Duration
 }
 
 type negotiatedRecoveryOptions struct {

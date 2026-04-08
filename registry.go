@@ -175,7 +175,14 @@ func registerGlobalTypes(protos ...Message) error {
 	return registerTypes(globalRegistry, protos...)
 }
 
-// RegisterGlobalType registers a message type (and its handler, if implemented) globally.
+// RegisterGlobalType registers a message type T (must be a struct or *struct)
+// in the global message registry. If T implements the handler interface
+// (Handle(*StreamContext) (Message, error)), its handler is also registered.
+//
+// Registration must happen before [Client.Connect] or [Server.Serve] since
+// connections snapshot the registry at creation time.
+//
+// Returns [ErrInvalidMessage] if T is not a valid message type.
 func RegisterGlobalType[T any]() error {
 	msg, err := newMessageForType[T]()
 	if err != nil {
@@ -184,7 +191,11 @@ func RegisterGlobalType[T any]() error {
 	return registerGlobalTypes(msg)
 }
 
-// MustRegisterGlobalType registers a type globally and panics on failure.
+// MustRegisterGlobalType is like [RegisterGlobalType] but panics on error.
+// It returns an empty struct so it can be used as a package-level variable
+// for init-time registration:
+//
+//	var _ = am.MustRegisterGlobalType[*MyMsg]()
 func MustRegisterGlobalType[T any]() struct{} {
 	if err := RegisterGlobalType[T](); err != nil {
 		panic(err)

@@ -32,7 +32,18 @@ type handlerJob struct {
 	msg     Message
 }
 
-// Connection is a live session and also acts as the default stream.
+// Connection is a live, negotiated session between two peers. It is obtained
+// from [Client.Connect] on the client side or passed to [Server] callbacks on
+// the server side.
+//
+// A Connection doubles as the default stream (stream 0): the [Connection.Send],
+// [Connection.SendRecv], [Connection.Recv], and [Connection.PeekWire] methods
+// all operate on stream 0. For multiplexed messaging, create additional streams
+// with [Connection.NewStream].
+//
+// All exported methods are safe for concurrent use. When the Connection is
+// closed (by either side), all outstanding streams are torn down and any
+// blocking Recv calls return [ErrClosed].
 type Connection struct {
 	conn              net.Conn
 	writer            *bufio.Writer
@@ -122,37 +133,54 @@ func (c *Connection) isRecoveryEnabled() bool {
 	return c != nil && c.recovery != nil && c.config.version == protocolVersionV3
 }
 
-// Close shuts down the connection and all streams.
+// Close shuts down the connection and all of its streams. It closes the
+// underlying transport, drains internal channels, and signals any goroutines
+// blocked in [Connection.Recv] or [Connection.WaitClosed]. Close is
+// non-blocking and idempotent; calling it more than once is safe.
 func (c *Connection) Close() {
 	c.markClosed()
 }
 
-// WaitClosed blocks until the connection closes.
+// WaitClosed blocks until the connection has fully closed. It is commonly used
+// in server handlers to keep the goroutine alive for the lifetime of the
+// connection.
 func (c *Connection) WaitClosed() {
 	<-c.closeCh
 }
 
-// Send writes a message on the default stream.
+// Send encodes msg and writes it on the default stream (stream 0). The call
+// is fire-and-forget: it returns once the frame is queued for the writer
+// goroutine. It returns [ErrClosed] if the connection has been shut down.
 func (c *Connection) Send(msg Message) error {
 	return c.defaultStream().Send(msg)
 }
 
-// SendRecv sends a message and waits for the reply on the default stream.
+// SendRecv sends msg on the default stream and blocks until a reply arrives,
+// returning the reply as an untyped [Message]. Use the generic helper
+// SendRecvAs for typed replies. Returns [ErrClosed] if the connection closes
+// before a reply is received.
 func (c *Connection) SendRecv(msg Message) (Message, error) {
 	return c.defaultStream().SendRecv(msg)
 }
 
-// Recv reads the next message from the default stream.
+// Recv blocks until the next message arrives on the default stream and returns
+// it as an untyped [Message]. It returns [ErrClosed] if the connection closes
+// and [ErrRecvTimeout] if a receive timeout (set via [Connection.SetRecvTimeout])
+// expires before a message arrives.
 func (c *Connection) Recv() (Message, error) {
 	return c.defaultStream().Recv()
 }
 
-// PeekWire returns the next wire name on the default stream without decoding.
+// PeekWire returns the wire name of the next message on the default stream
+// without consuming or fully decoding it. This is useful for branching on the
+// message type before calling a typed receive.
 func (c *Connection) PeekWire() (string, error) {
 	return c.defaultStream().PeekWire()
 }
 
-// SetRecvTimeout sets the default stream receive timeout.
+// SetRecvTimeout sets the receive timeout for the default stream (stream 0).
+// A zero or negative value disables the timeout, allowing [Connection.Recv]
+// to block indefinitely.
 func (c *Connection) SetRecvTimeout(timeout time.Duration) {
 	c.defaultStream().SetRecvTimeout(timeout)
 }
@@ -171,7 +199,10 @@ func (c *Connection) streamForID(streamID uint32) *streamCore {
 	return streamCtx.stream.core
 }
 
-// NewStream allocates a new stream ID and returns a Stream view.
+// NewStream allocates a new stream ID and returns a [Stream] view scoped to
+// that ID. Streams provide independent, multiplexed message channels over the
+// same underlying connection. All streams are automatically closed when the
+// parent Connection is closed.
 func (c *Connection) NewStream() *Stream[Message] {
 	streamID := c.nextStreamID.Add(1)
 	return &Stream[Message]{core: c.streamForID(streamID)}

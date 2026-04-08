@@ -1,12 +1,17 @@
 package adaptivemsg
 
-// Link is the sealed interface for SendRecvAs targets.
-// Connection, Stream, and OnceConn implement Link.
+// Link is a sealed interface that unifies [Connection], [Stream], and
+// [OnceConn] as valid targets for [SendRecvAs] and [StreamAs]. The
+// unexported isLink method prevents external packages from implementing
+// Link.
 type Link interface {
 	isLink()
 }
 
-// StreamAs returns a typed Stream view for a Link.
+// StreamAs creates a typed [Stream][T] view from any [Link]. It does not
+// allocate a new stream — it wraps the existing stream core with the
+// requested type parameter. Returns nil if v is nil or has no underlying
+// stream core.
 func StreamAs[T any](v Link) *Stream[T] {
 	vcp, ok := v.(viewCoreProvider)
 	if !ok || v == nil {
@@ -22,8 +27,11 @@ func StreamAs[T any](v Link) *Stream[T] {
 	return &Stream[T]{core: core}
 }
 
-// SendRecvAs sends a message and receives a typed reply.
-// The target v can be a Connection, Stream, or OnceConn.
+// SendRecvAs sends msg via the given [Link] and receives a typed reply of
+// type T. When v is an [OnceConn], SendRecvAs dials the address, exchanges
+// one request-reply message, and closes the connection. When v is a
+// [Connection] or [Stream], it delegates to [Stream.SendRecv]. Returns
+// [ErrInvalidMessage] if v is nil.
 func SendRecvAs[T any](v Link, msg Message) (T, error) {
 	var zero T
 	if v == nil {

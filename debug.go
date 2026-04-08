@@ -6,29 +6,51 @@ import (
 	"time"
 )
 
+// DebugFailureCode is a string code identifying the subsystem and failure mode
+// for diagnostic purposes. Values follow the pattern "subsystem.failure_kind".
 type DebugFailureCode string
 
 const (
-	DebugFailureNone                    DebugFailureCode = ""
-	DebugFailureStreamRecvTimeout       DebugFailureCode = "stream.recv_timeout"
-	DebugFailureStreamEncode            DebugFailureCode = "stream.encode"
-	DebugFailureStreamEnqueue           DebugFailureCode = "stream.enqueue"
-	DebugFailureStreamProtocol          DebugFailureCode = "stream.protocol"
+	// DebugFailureNone indicates no failure has been recorded.
+	DebugFailureNone DebugFailureCode = ""
+	// DebugFailureStreamRecvTimeout indicates a stream receive timed out.
+	DebugFailureStreamRecvTimeout DebugFailureCode = "stream.recv_timeout"
+	// DebugFailureStreamEncode indicates message encoding failed on a stream.
+	DebugFailureStreamEncode DebugFailureCode = "stream.encode"
+	// DebugFailureStreamEnqueue indicates a failure to enqueue a frame for sending.
+	DebugFailureStreamEnqueue DebugFailureCode = "stream.enqueue"
+	// DebugFailureStreamProtocol indicates a protocol error on a stream (e.g. unknown message).
+	DebugFailureStreamProtocol DebugFailureCode = "stream.protocol"
+	// DebugFailureStreamProtocolReplySend indicates a failure to send a protocol error reply.
 	DebugFailureStreamProtocolReplySend DebugFailureCode = "stream.protocol_reply_send"
-	DebugFailureStreamDecode            DebugFailureCode = "stream.decode"
-	DebugFailureHandler                 DebugFailureCode = "handler.error"
-	DebugFailureWriterLoop              DebugFailureCode = "connection.writer"
-	DebugFailureReaderLoop              DebugFailureCode = "connection.reader"
-	DebugFailureReaderEnqueue           DebugFailureCode = "connection.reader_enqueue"
-	DebugFailureReconnectResume         DebugFailureCode = "recovery.resume"
-	DebugFailureReconnectTerminal       DebugFailureCode = "recovery.reconnect_terminal"
-	DebugFailureRecoveryAckWrite        DebugFailureCode = "recovery.ack_write"
-	DebugFailureRecoveryResumeWrite     DebugFailureCode = "recovery.resume_write"
-	DebugFailureRecoveryLiveWrite       DebugFailureCode = "recovery.live_write"
-	DebugFailureRecoveryPingWrite       DebugFailureCode = "recovery.ping_write"
-	DebugFailureRecoveryRead            DebugFailureCode = "recovery.read"
-	DebugFailureRecoveryControl         DebugFailureCode = "recovery.control"
-	DebugFailureRecoveryData            DebugFailureCode = "recovery.data"
+	// DebugFailureStreamDecode indicates message decoding failed on a stream.
+	DebugFailureStreamDecode DebugFailureCode = "stream.decode"
+	// DebugFailureHandler indicates a handler returned an error.
+	DebugFailureHandler DebugFailureCode = "handler.error"
+	// DebugFailureWriterLoop indicates the connection writer goroutine failed.
+	DebugFailureWriterLoop DebugFailureCode = "connection.writer"
+	// DebugFailureReaderLoop indicates the connection reader goroutine failed.
+	DebugFailureReaderLoop DebugFailureCode = "connection.reader"
+	// DebugFailureReaderEnqueue indicates the reader failed to enqueue a payload to a stream.
+	DebugFailureReaderEnqueue DebugFailureCode = "connection.reader_enqueue"
+	// DebugFailureReconnectResume indicates a recovery resume attempt failed.
+	DebugFailureReconnectResume DebugFailureCode = "recovery.resume"
+	// DebugFailureReconnectTerminal indicates recovery gave up after exhausting retries.
+	DebugFailureReconnectTerminal DebugFailureCode = "recovery.reconnect_terminal"
+	// DebugFailureRecoveryAckWrite indicates a failure to write an ACK control frame.
+	DebugFailureRecoveryAckWrite DebugFailureCode = "recovery.ack_write"
+	// DebugFailureRecoveryResumeWrite indicates a failure to write a resume frame.
+	DebugFailureRecoveryResumeWrite DebugFailureCode = "recovery.resume_write"
+	// DebugFailureRecoveryLiveWrite indicates a failure to write a live data frame during recovery.
+	DebugFailureRecoveryLiveWrite DebugFailureCode = "recovery.live_write"
+	// DebugFailureRecoveryPingWrite indicates a failure to write a heartbeat ping.
+	DebugFailureRecoveryPingWrite DebugFailureCode = "recovery.ping_write"
+	// DebugFailureRecoveryRead indicates an error reading during recovery.
+	DebugFailureRecoveryRead DebugFailureCode = "recovery.read"
+	// DebugFailureRecoveryControl indicates an error processing a recovery control frame.
+	DebugFailureRecoveryControl DebugFailureCode = "recovery.control"
+	// DebugFailureRecoveryData indicates an error processing a recovery data frame.
+	DebugFailureRecoveryData DebugFailureCode = "recovery.data"
 )
 
 type connectionDebugCounters struct {
@@ -72,90 +94,170 @@ type streamDebugCounters struct {
 	lastFailureUnixNanos          atomic.Int64
 }
 
+// ConnectionCounters holds point-in-time counters for a connection.
+// All values are cumulative since the connection was created.
 type ConnectionCounters struct {
-	StreamsOpened                 uint64
-	StreamsClosed                 uint64
-	DataMessagesSent              uint64
-	DataMessagesReceived          uint64
-	FramesWritten                 uint64
-	FramesRead                    uint64
-	BytesWritten                  uint64
-	BytesRead                     uint64
-	ControlFramesWritten          uint64
-	ControlFramesRead             uint64
-	ProtocolErrors                uint64
+	// StreamsOpened is the total number of streams opened.
+	StreamsOpened uint64
+	// StreamsClosed is the total number of streams closed.
+	StreamsClosed uint64
+	// DataMessagesSent is the total number of application-level messages sent.
+	DataMessagesSent uint64
+	// DataMessagesReceived is the total number of application-level messages received.
+	DataMessagesReceived uint64
+	// FramesWritten is the total number of wire frames written.
+	FramesWritten uint64
+	// FramesRead is the total number of wire frames read.
+	FramesRead uint64
+	// BytesWritten is the total number of bytes written to the transport.
+	BytesWritten uint64
+	// BytesRead is the total number of bytes read from the transport.
+	BytesRead uint64
+	// ControlFramesWritten is the total number of control frames written.
+	ControlFramesWritten uint64
+	// ControlFramesRead is the total number of control frames read.
+	ControlFramesRead uint64
+	// ProtocolErrors is the total number of protocol errors detected.
+	ProtocolErrors uint64
+	// ProtocolErrorReplySendFailure is how many times sending a protocol error reply failed.
 	ProtocolErrorReplySendFailure uint64
-	RemoteErrors                  uint64
-	DecodeErrors                  uint64
-	HandlerCalls                  uint64
-	HandlerErrors                 uint64
-	ReconnectAttempts             uint64
-	ReconnectSuccesses            uint64
-	ReconnectFailures             uint64
-	TransportAttaches             uint64
-	TransportDetaches             uint64
+	// RemoteErrors is the total number of remote ErrorReply messages received.
+	RemoteErrors uint64
+	// DecodeErrors is the total number of message decode failures.
+	DecodeErrors uint64
+	// HandlerCalls is the total number of handler invocations.
+	HandlerCalls uint64
+	// HandlerErrors is the total number of handler invocations that returned an error.
+	HandlerErrors uint64
+	// ReconnectAttempts is the total number of recovery reconnect attempts.
+	ReconnectAttempts uint64
+	// ReconnectSuccesses is the total number of successful recovery reconnects.
+	ReconnectSuccesses uint64
+	// ReconnectFailures is the total number of failed recovery reconnect attempts.
+	ReconnectFailures uint64
+	// TransportAttaches is the total number of times a transport was attached.
+	TransportAttaches uint64
+	// TransportDetaches is the total number of times a transport was detached.
+	TransportDetaches uint64
 }
 
+// StreamCounters holds point-in-time counters for a single stream.
+// All values are cumulative since the stream was opened.
 type StreamCounters struct {
-	DataMessagesSent              uint64
-	DataMessagesReceived          uint64
-	ProtocolErrors                uint64
+	// DataMessagesSent is the total number of application-level messages sent on this stream.
+	DataMessagesSent uint64
+	// DataMessagesReceived is the total number of application-level messages received on this stream.
+	DataMessagesReceived uint64
+	// ProtocolErrors is the total number of protocol errors detected on this stream.
+	ProtocolErrors uint64
+	// ProtocolErrorReplySendFailure is how many times sending a protocol error reply failed on this stream.
 	ProtocolErrorReplySendFailure uint64
-	RemoteErrors                  uint64
-	DecodeErrors                  uint64
-	HandlerCalls                  uint64
-	HandlerErrors                 uint64
+	// RemoteErrors is the total number of remote ErrorReply messages received on this stream.
+	RemoteErrors uint64
+	// DecodeErrors is the total number of message decode failures on this stream.
+	DecodeErrors uint64
+	// HandlerCalls is the total number of handler invocations on this stream.
+	HandlerCalls uint64
+	// HandlerErrors is the total number of handler invocations that returned an error on this stream.
+	HandlerErrors uint64
 }
 
+// StreamDebugState is a debug snapshot of a stream's state at a point in time.
 type StreamDebugState struct {
-	ID              uint32
-	Closed          bool
+	// ID is the stream's numeric identifier within the connection.
+	ID uint32
+	// Closed is true if the stream has been closed.
+	Closed bool
+	// LastFailureCode is the code of the most recent failure on this stream.
 	LastFailureCode DebugFailureCode
-	LastFailure     string
-	LastFailureAt   time.Time
-	RecvTimeout     time.Duration
-	InboxDepth      int
-	IncomingDepth   int
-	HandlerQDepth   int
-	Counters        StreamCounters
+	// LastFailure is the human-readable description of the most recent failure.
+	LastFailure string
+	// LastFailureAt is the timestamp of the most recent failure.
+	LastFailureAt time.Time
+	// RecvTimeout is the stream's current receive timeout duration.
+	RecvTimeout time.Duration
+	// InboxDepth is the number of decoded messages waiting in the stream's inbox.
+	InboxDepth int
+	// IncomingDepth is the number of raw frames waiting to be decoded.
+	IncomingDepth int
+	// HandlerQDepth is the number of messages queued for handler dispatch.
+	HandlerQDepth int
+	// Counters holds the cumulative stream counters.
+	Counters StreamCounters
 }
 
+// RecoveryDebugState is a debug snapshot of the recovery subsystem's state
+// at a point in time.
 type RecoveryDebugState struct {
-	Role              string
-	ConnectionID      string
+	// Role is "client" or "server", indicating which recovery role this connection has.
+	Role string
+	// ConnectionID is the hex-encoded recovery connection identifier.
+	ConnectionID string
+	// TransportAttached is true if a live transport is currently connected.
 	TransportAttached bool
-	TransportGen      uint64
-	ReconnectActive   bool
-	LastRecvSeq       uint64
-	LastAckedSeq      uint64
-	AckPending        uint32
-	AckDue            bool
-	AckEvery          uint32
-	AckDelay          time.Duration
+	// TransportGen is the generation counter for transport attach/detach cycles.
+	TransportGen uint64
+	// ReconnectActive is true if a reconnect attempt is currently in progress.
+	ReconnectActive bool
+	// LastRecvSeq is the sequence number of the last received data frame.
+	LastRecvSeq uint64
+	// LastAckedSeq is the sequence number of the last acknowledged data frame.
+	LastAckedSeq uint64
+	// AckPending is the number of received frames not yet acknowledged.
+	AckPending uint32
+	// AckDue is true if an ACK is pending and should be sent soon.
+	AckDue bool
+	// AckEvery is the negotiated ACK frequency (every N data frames).
+	AckEvery uint32
+	// AckDelay is the negotiated delay before flushing a pending ACK.
+	AckDelay time.Duration
+	// HeartbeatInterval is the negotiated interval between heartbeat pings.
 	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
-	ReplayQueued      int
-	ReplayBytes       int64
-	LiveQueueDepth    int
-	ResumeQueueDepth  int
+	// HeartbeatTimeout is the negotiated inactivity timeout for the connection.
+	HeartbeatTimeout time.Duration
+	// ReplayQueued is the number of frames currently buffered for replay.
+	ReplayQueued int
+	// ReplayBytes is the total size in bytes of frames buffered for replay.
+	ReplayBytes int64
+	// LiveQueueDepth is the number of frames in the live send queue.
+	LiveQueueDepth int
+	// ResumeQueueDepth is the number of frames queued for resume replay.
+	ResumeQueueDepth int
 }
 
+// ConnectionDebugState is a debug snapshot of a connection at a point in time,
+// including counters, stream states, and recovery state.
 type ConnectionDebugState struct {
-	Closed          bool
+	// Closed is true if the connection has been closed.
+	Closed bool
+	// LastFailureCode is the code of the most recent failure on this connection.
 	LastFailureCode DebugFailureCode
-	LastFailure     string
-	LastFailureAt   time.Time
-	Protocol        byte
-	CodecID         CodecID
-	CodecName       string
-	MaxFrame        uint32
-	StreamCount     int
-	NextSendSeq     uint64
-	Counters        ConnectionCounters
-	Streams         []StreamDebugState
-	Recovery        *RecoveryDebugState
+	// LastFailure is the human-readable description of the most recent failure.
+	LastFailure string
+	// LastFailureAt is the timestamp of the most recent failure.
+	LastFailureAt time.Time
+	// Protocol is the negotiated protocol version byte.
+	Protocol byte
+	// CodecID is the negotiated codec identifier.
+	CodecID CodecID
+	// CodecName is the human-readable name of the negotiated codec.
+	CodecName string
+	// MaxFrame is the negotiated maximum frame size in bytes.
+	MaxFrame uint32
+	// StreamCount is the current number of streams (open and closing).
+	StreamCount int
+	// NextSendSeq is the next sequence number to be assigned to an outbound frame.
+	NextSendSeq uint64
+	// Counters holds the cumulative connection counters.
+	Counters ConnectionCounters
+	// Streams contains a snapshot of each stream's debug state.
+	Streams []StreamDebugState
+	// Recovery contains the recovery subsystem state, or nil if recovery is not enabled.
+	Recovery *RecoveryDebugState
 }
 
+// DebugState returns a point-in-time snapshot of the connection's debug
+// counters, stream states, and recovery state.
 func (c *Connection) DebugState() ConnectionDebugState {
 	if c == nil {
 		return ConnectionDebugState{}
@@ -193,6 +295,8 @@ func (c *Connection) DebugState() ConnectionDebugState {
 	return state
 }
 
+// DebugState returns a point-in-time snapshot of this stream's debug
+// counters and state.
 func (s *Stream[T]) DebugState() StreamDebugState {
 	if s == nil || s.core == nil {
 		return StreamDebugState{}

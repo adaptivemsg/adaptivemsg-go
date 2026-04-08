@@ -23,7 +23,20 @@ type streamCore struct {
 	closeOnce        sync.Once
 }
 
-// Stream is a typed view over a single stream ID.
+// Stream is a typed view over a single multiplexed stream on a [Connection].
+//
+// The type parameter T determines how [Stream.SendRecv] and [Stream.Recv]
+// decode incoming messages. When T is an interface (e.g. [Message]), the
+// connection's message registry is consulted to resolve the concrete type
+// from the wire name. When T is a concrete type (e.g. *EchoReply), the
+// payload is decoded directly into that type without a registry lookup.
+//
+// Create a Stream with [Connection.NewStream] (which returns Stream[Message])
+// or convert an existing stream to a different reply type with [StreamAs].
+//
+// Send is safe for concurrent use by multiple goroutines. Recv and SendRecv
+// must not be called concurrently on the same Stream; doing so returns
+// [ErrConcurrentRecv].
 type Stream[T any] struct {
 	core *streamCore
 }
@@ -41,27 +54,43 @@ func (s *Stream[T]) viewCore() *streamCore {
 
 func (*Stream[T]) isLink() {}
 
-// ID returns the stream ID.
+// ID returns the numeric stream identifier assigned by the connection.
+// Stream IDs are unique within a single connection.
 func (s *Stream[T]) ID() uint32 {
 	return s.core.id
 }
 
-// Close removes the stream from its connection.
+// Close removes this stream from its connection and releases associated
+// resources. After Close returns, subsequent Send and Recv calls on this
+// stream will return [ErrClosed]. Close is idempotent.
 func (s *Stream[T]) Close() {
 	s.core.connection.removeStream(s.core.id)
 }
 
-// SetRecvTimeout sets the receive timeout for this stream.
+// SetRecvTimeout sets the maximum duration that [Stream.Recv] and
+// [Stream.SendRecv] will block waiting for a message on this stream.
+// A zero or negative value disables the timeout, causing receives to
+// block indefinitely until a message arrives or the connection closes.
+// The default is no timeout.
 func (s *Stream[T]) SetRecvTimeout(timeout time.Duration) {
 	s.core.setRecvTimeout(timeout)
 }
 
-// Send encodes and writes a message on this stream.
+// Send encodes msg with the negotiated codec and enqueues the resulting
+// frame for transmission on this stream. Send returns as soon as the frame
+// is queued; it does not wait for the peer to receive it.
+//
+// Send is safe for concurrent use. It returns [ErrClosed] if the
+// connection has been shut down.
 func (s *Stream[T]) Send(msg Message) error {
 	return s.core.sendBoxed(msg)
 }
 
-// SendRecv sends a message and waits for a typed reply.
+// SendRecv sends msg on this stream and blocks until a reply of type T is
+// received. If the peer handler returns an error, the reply is decoded as
+// an [ErrorReply] and returned as [ErrRemote]. If the incoming message
+// cannot be converted to T, [ErrTypeMismatch] is returned. The call also
+// respects the receive timeout set by [Stream.SetRecvTimeout].
 func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	var zero T
 	if err := s.core.sendBoxed(msg); err != nil {
@@ -102,7 +131,13 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	return typed, nil
 }
 
-// Recv reads and decodes the next message from this stream.
+// Recv blocks until the next message arrives on this stream and decodes it
+// as type T. It returns [ErrRecvTimeout] if the receive timeout expires,
+// [ErrClosed] if the connection is shut down, or [ErrTypeMismatch] if the
+// decoded message cannot be converted to T.
+//
+// Only one goroutine may call Recv (or SendRecv) at a time; a concurrent
+// call returns [ErrConcurrentRecv].
 func (s *Stream[T]) Recv() (T, error) {
 	var zero T
 	raw, err := s.core.recvRaw()
@@ -130,7 +165,10 @@ func (s *Stream[T]) Recv() (T, error) {
 	return typed, nil
 }
 
-// PeekWire returns the next wire name without decoding.
+// PeekWire returns the wire name of the next pending message without
+// consuming it. The message remains available for a subsequent [Stream.Recv]
+// or [Stream.SendRecv] call. PeekWire is useful for dispatching based on
+// message type before committing to a decode.
 func (s *Stream[T]) PeekWire() (string, error) {
 	return s.core.peekWire()
 }

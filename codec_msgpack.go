@@ -11,9 +11,15 @@ import (
 )
 
 const (
-	// CodecMsgpackCompact encodes messages as a MessagePack compact array envelope.
+	// CodecMsgpackCompact (ID=1) encodes messages as a compact MessagePack array
+	// envelope: [wireName, field1, field2, ...]. This format is more
+	// space-efficient than map encoding but requires field order to match
+	// between sender and receiver.
 	CodecMsgpackCompact CodecID = 1
-	// CodecMsgpackMap encodes messages as a MessagePack map envelope.
+	// CodecMsgpackMap (ID=2) encodes messages as a MessagePack map envelope:
+	// {"type": wireName, "data": {field: value, ...}}. This format is more
+	// verbose than compact but tolerant of field order changes between sender
+	// and receiver.
 	CodecMsgpackMap CodecID = 2
 )
 

@@ -9,7 +9,10 @@ var codecRegistry = struct {
 	codecs: make(map[CodecID]CodecImpl),
 }
 
-// RegisterCodec installs a codec implementation globally.
+// RegisterCodec installs a codec implementation in the global codec registry.
+// The codec's ID must be non-zero and not already registered. RegisterCodec
+// is safe for concurrent use. Built-in codecs (compact, map) are registered
+// automatically via init().
 func RegisterCodec(codec CodecImpl) error {
 	if codec == nil {
 		return ErrInvalidMessage{Reason: "codec must be non-nil"}
@@ -30,7 +33,9 @@ func RegisterCodec(codec CodecImpl) error {
 	return nil
 }
 
-// MustRegisterCodec registers a codec and panics on failure.
+// MustRegisterCodec is like [RegisterCodec] but panics on error. It returns
+// an empty struct so it can be used as a package-level variable for init-time
+// registration.
 func MustRegisterCodec(codec CodecImpl) struct{} {
 	if err := RegisterCodec(codec); err != nil {
 		panic(err)

@@ -7,7 +7,16 @@ import (
 	"time"
 )
 
-// Client configures outbound connections.
+// Client configures and dials outbound connections. It uses a builder pattern
+// so options can be chained before calling [Client.Connect]:
+//
+//	conn, err := adaptivemsg.NewClient().
+//		WithTimeout(5 * time.Second).
+//		WithCodecs(adaptivemsg.CodecMsgpackCompact).
+//		Connect("tcp://127.0.0.1:9000")
+//
+// Defaults: codecs [CodecMsgpackCompact, CodecMsgpackMap], max frame
+// unlimited (peer's limit applies), recovery disabled.
 type Client struct {
 	timeout  time.Duration
 	maxFrame uint32
@@ -16,7 +25,9 @@ type Client struct {
 	recovery ClientRecoveryOptions
 }
 
-// NewClient returns a client with default settings.
+// NewClient returns a Client with sensible defaults: both MessagePack codecs
+// offered ([CodecMsgpackCompact] first, then [CodecMsgpackMap]), no dial
+// timeout, unlimited max frame size, and recovery disabled.
 func NewClient() *Client {
 	return &Client{
 		codecs:   []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
@@ -26,31 +37,54 @@ func NewClient() *Client {
 	}
 }
 
-// WithTimeout sets the dial timeout and returns the client.
+// WithTimeout sets the timeout applied to the TCP dial (or Unix connect) and
+// any subsequent TLS handshake. A zero or negative value disables the timeout,
+// allowing the connection attempt to block indefinitely.
 func (c *Client) WithTimeout(timeout time.Duration) *Client {
 	c.timeout = timeout
 	return c
 }
 
-// WithCodecs sets the preferred codec list; the server picks the first common codec in this order.
+// WithCodecs sets the client's ordered list of preferred codecs. During the
+// handshake the server walks this list and selects the first codec it also
+// supports, so place the most desirable codec first. If no common codec
+// exists the handshake fails with [ErrNoCommonCodec].
 func (c *Client) WithCodecs(codecs ...CodecID) *Client {
 	c.codecs = append([]CodecID(nil), codecs...)
 	return c
 }
 
-// WithMaxFrame sets the maximum frame size advertised to the peer.
+// WithMaxFrame sets the maximum payload size per frame that this client
+// advertises to the peer. The effective limit for the connection is the
+// minimum of both sides' values. The default is math.MaxUint32 (no
+// client-side limit), so the server's value takes precedence.
 func (c *Client) WithMaxFrame(maxFrame uint32) *Client {
 	c.maxFrame = maxFrame
 	return c
 }
 
-// WithRecovery configures recovery behavior and returns the client.
+// WithRecovery enables the v3 protocol extension that supports transparent
+// reconnection and message replay after transient network failures. See
+// [ClientRecoveryOptions] for tunables such as backoff intervals and replay
+// buffer limits. When recovery is enabled the client will attempt the v3
+// handshake first and fall back to v2 if the server does not support it.
 func (c *Client) WithRecovery(opts ClientRecoveryOptions) *Client {
 	c.recovery = opts.normalized()
 	return c
 }
 
-// Connect dials the address and returns a live Connection.
+// Connect dials addr, performs the protocol handshake (including codec
+// negotiation), and returns a live [Connection] ready for messaging.
+//
+// Supported address formats:
+//
+//   - "tcp://host:port" — TCP connection
+//   - "uds:///path/to/sock" or "unix:///path/to/sock" — Unix domain socket
+//   - "host:port" — bare host:port defaults to TCP
+//
+// On failure Connect returns one of the typed errors: [ErrConnectTimeout] if
+// the dial or handshake exceeds the configured timeout, [ErrNoCommonCodec] if
+// no codec overlap exists, or a transport-level error from the operating system.
 func (c *Client) Connect(addr string) (*Connection, error) {
 	versions := []byte{protocolVersionV2}
 	if c.recovery.Enable {
