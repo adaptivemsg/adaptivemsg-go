@@ -28,7 +28,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		reply, err := am.SendRecvAs[*hello.HelloReply](conn, &hello.HelloRequest{
+		reply, err := conn.SendRecv[*hello.HelloReply](&hello.HelloRequest{
 			Who:      "John",
 			Question: "who are you",
 		})
@@ -41,7 +41,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		reply, err := am.SendRecvAs[*hello.HelloReply](streamA, &hello.HelloRequest{
+		reply, err := streamA.SendRecv[*hello.HelloReply](&hello.HelloRequest{
 			Who:      "Alice",
 			Question: "how are you",
 		})
@@ -54,7 +54,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		_, err := am.SendRecvAs[*hello.HelloReply](streamB, &hello.HelloRequest{
+		_, err := streamB.SendRecv[*hello.HelloReply](&hello.HelloRequest{
 			Who:      "Bob",
 			Question: "error please",
 		})

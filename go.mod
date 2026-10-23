@@ -1,6 +1,6 @@
 module github.com/adaptivemsg/adaptivemsg-go
 
-go 1.22
+go 1.27
 
 require github.com/vmihailenco/msgpack/v5 v5.4.1
 

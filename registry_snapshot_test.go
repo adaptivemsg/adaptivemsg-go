@@ -24,8 +24,8 @@ func TestRegistrySnapshotIsolation(t *testing.T) {
 		t.Fatalf("snapshot should not contain new type")
 	}
 
-	if err := RegisterGlobalType[registrySnapshotMsg](); err != nil {
-		t.Fatalf("RegisterGlobalType: %v", err)
+	if err := Register[registrySnapshotMsg](); err != nil {
+		t.Fatalf("Register: %v", err)
 	}
 	if _, ok := snapshot.message(wire); ok {
 		t.Fatalf("snapshot should not be mutated by global registration")

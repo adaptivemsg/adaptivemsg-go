@@ -8,7 +8,18 @@ import (
 	"sync/atomic"
 )
 
-type streamCore struct {
+// Stream is a single multiplexed stream on a [Connection].
+//
+// The type argument supplied to [Stream.SendRecv] or [Stream.Recv] determines
+// how each incoming message is decoded. When that type is an interface (for
+// example [Message]), the connection's message registry resolves the concrete
+// type from the wire name. A concrete type (for example *EchoReply) is decoded
+// directly without a registry lookup.
+//
+// Send is safe for concurrent use by multiple goroutines. Recv and SendRecv
+// must not be called concurrently on the same Stream; doing so returns
+// [ErrConcurrentRecv].
+type Stream struct {
 	id               uint32
 	connection       *Connection
 	debug            streamDebugCounters
@@ -21,50 +32,47 @@ type streamCore struct {
 	hasPeeked        bool
 	closed           atomic.Bool
 	closeOnce        sync.Once
+	sendMu           sync.Mutex
 }
-
-// Stream is a typed view over a single multiplexed stream on a [Connection].
-//
-// The type parameter T determines how [Stream.SendRecv] and [Stream.Recv]
-// decode incoming messages. When T is an interface (e.g. [Message]), the
-// connection's message registry is consulted to resolve the concrete type
-// from the wire name. When T is a concrete type (e.g. *EchoReply), the
-// payload is decoded directly into that type without a registry lookup.
-//
-// Create a Stream with [Connection.NewStream] (which returns Stream[Message])
-// or convert an existing stream to a different reply type with [StreamAs].
-//
-// Send is safe for concurrent use by multiple goroutines. Recv and SendRecv
-// must not be called concurrently on the same Stream; doing so returns
-// [ErrConcurrentRecv].
-type Stream[T any] struct {
-	core *streamCore
-}
-
-type viewCoreProvider interface {
-	viewCore() *streamCore
-}
-
-func (s *Stream[T]) viewCore() *streamCore {
-	if s == nil {
-		return nil
-	}
-	return s.core
-}
-
-func (*Stream[T]) isLink() {}
 
 // ID returns the numeric stream identifier assigned by the connection.
 // Stream IDs are unique within a single connection.
-func (s *Stream[T]) ID() uint32 {
-	return s.core.id
+func (s *Stream) ID() uint32 {
+	return s.id
 }
 
-// Close removes this stream from its connection and releases associated
-// resources. After Close returns, subsequent Send and Recv calls on this
-// stream will return [ErrClosed]. Close is idempotent.
-func (s *Stream[T]) Close() {
-	s.core.connection.removeStream(s.core.id)
+// Close releases this stream. If this side opened the stream with
+// [Connection.NewStream], Close first queues a FIN frame so the peer can
+// release its copy. Only the opener sends FIN, so a stream opened by the peer
+// is released locally, as is stream 0, whose lifetime follows the connection.
+// After Close returns, subsequent Send and Recv calls on this stream return
+// [ErrClosed]. Close is idempotent.
+func (s *Stream) Close() {
+	if s == nil || s.connection == nil {
+		return
+	}
+	if !s.connection.openedStream(s.id) {
+		s.connection.removeStream(s.id)
+		return
+	}
+	s.sendMu.Lock()
+	if s.closed.Load() {
+		s.sendMu.Unlock()
+		return
+	}
+	s.closed.Store(true)
+	// The payload must be non-nil: the recovery writer treats a nil payload
+	// as "no frame".
+	err := s.connection.enqueueFrame(outboundFrame{
+		streamID: s.id,
+		flags:    FrameFlagFIN,
+		payload:  []byte{},
+	})
+	s.sendMu.Unlock()
+	s.connection.removeStream(s.id)
+	if err != nil {
+		s.debug.noteFailure(DebugFailureStreamEnqueue, "fin enqueue failed: "+err.Error())
+	}
 }
 
 // SetRecvTimeout sets the maximum duration that [Stream.Recv] and
@@ -72,8 +80,8 @@ func (s *Stream[T]) Close() {
 // A zero or negative value disables the timeout, causing receives to
 // block indefinitely until a message arrives or the connection closes.
 // The default is no timeout.
-func (s *Stream[T]) SetRecvTimeout(timeout time.Duration) {
-	s.core.setRecvTimeout(timeout)
+func (s *Stream) SetRecvTimeout(timeout time.Duration) {
+	s.setRecvTimeout(timeout)
 }
 
 // Send encodes msg with the negotiated codec and enqueues the resulting
@@ -82,38 +90,47 @@ func (s *Stream[T]) SetRecvTimeout(timeout time.Duration) {
 //
 // Send is safe for concurrent use. It returns [ErrClosed] if the
 // connection has been shut down.
-func (s *Stream[T]) Send(msg Message) error {
-	return s.core.sendBoxed(msg)
+func (s *Stream) Send(msg Message) error {
+	return s.sendBoxed(msg)
 }
 
 // SendRecv sends msg on this stream and blocks until a reply of type T is
-// received. If the peer handler returns an error, the reply is decoded as
-// an [ErrorReply] and returned as [ErrRemote]. If the incoming message
-// cannot be converted to T, [ErrTypeMismatch] is returned. The call also
-// respects the receive timeout set by [Stream.SetRecvTimeout].
-func (s *Stream[T]) SendRecv(msg Message) (T, error) {
+// received. If the peer handler returns an error, the reply is decoded as an
+// [ErrorReply] and returned as [ErrRemote]. If the incoming message cannot be
+// converted to T, [ErrTypeMismatch] is returned. The call also respects the
+// receive timeout set by [Stream.SetRecvTimeout].
+func (s *Stream) SendRecv[T any](msg Message) (T, error) {
+	return sendRecvAs[T](s, msg)
+}
+
+func sendRecvAs[T any](stream *Stream, msg Message) (T, error) {
 	var zero T
-	if err := s.core.sendBoxed(msg); err != nil {
+	if err := stream.sendBoxed(msg); err != nil {
 		return zero, err
 	}
-	raw, err := s.core.recvRaw()
+	raw, err := stream.recvRaw()
 	if err != nil {
 		return zero, err
 	}
 	if raw.Wire == errorReplyWireName {
 		reply, err := decodeRawAs[*ErrorReply](raw)
 		if err != nil {
-			s.core.noteDecodeError(err)
-			s.core.protocolError("codec_error", err.Error())
+			stream.noteDecodeError(err)
+			stream.protocolError("codec_error", err.Error())
 			return zero, err
 		}
-		s.core.noteRemoteError()
+		stream.noteRemoteError()
 		return zero, ErrRemote{Code: reply.Code, Message: reply.Message}
 	}
+	return decodeStreamRawAs[T](stream, raw)
+}
+
+func decodeStreamRawAs[T any](stream *Stream, raw rawMessage) (T, error) {
+	var zero T
 	if isInterfaceType[T]() {
-		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
+		decoded, err := decodeRawWithRegistry(raw, stream.connection.registry)
 		if err != nil {
-			s.core.noteDecodeError(err)
+			stream.noteDecodeError(err)
 			return zero, err
 		}
 		typed, ok := decoded.(T)
@@ -124,8 +141,8 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 	}
 	typed, err := decodeRawAs[T](raw)
 	if err != nil {
-		s.core.noteDecodeError(err)
-		s.core.protocolErrorFor(err)
+		stream.noteDecodeError(err)
+		stream.protocolErrorFor(err)
 		return zero, err
 	}
 	return typed, nil
@@ -138,42 +155,24 @@ func (s *Stream[T]) SendRecv(msg Message) (T, error) {
 //
 // Only one goroutine may call Recv (or SendRecv) at a time; a concurrent
 // call returns [ErrConcurrentRecv].
-func (s *Stream[T]) Recv() (T, error) {
+func (s *Stream) Recv[T any]() (T, error) {
 	var zero T
-	raw, err := s.core.recvRaw()
+	raw, err := s.recvRaw()
 	if err != nil {
 		return zero, err
 	}
-	if isInterfaceType[T]() {
-		decoded, err := decodeRawWithRegistry(raw, s.core.connection.registry)
-		if err != nil {
-			s.core.noteDecodeError(err)
-			return zero, err
-		}
-		typed, ok := decoded.(T)
-		if !ok {
-			return zero, ErrTypeMismatch{Expected: expectedWireName[T](), Got: wireNameForValue(decoded)}
-		}
-		return typed, nil
-	}
-	typed, err := decodeRawAs[T](raw)
-	if err != nil {
-		s.core.noteDecodeError(err)
-		s.core.protocolErrorFor(err)
-		return zero, err
-	}
-	return typed, nil
+	return decodeStreamRawAs[T](s, raw)
 }
 
 // PeekWire returns the wire name of the next pending message without
 // consuming it. The message remains available for a subsequent [Stream.Recv]
 // or [Stream.SendRecv] call. PeekWire is useful for dispatching based on
 // message type before committing to a decode.
-func (s *Stream[T]) PeekWire() (string, error) {
-	return s.core.peekWire()
+func (s *Stream) PeekWire() (string, error) {
+	return s.peekWire()
 }
 
-func (s *streamCore) setRecvTimeout(timeout time.Duration) {
+func (s *Stream) setRecvTimeout(timeout time.Duration) {
 	if timeout <= 0 {
 		s.recvTimeoutNanos.Store(0)
 		return
@@ -181,7 +180,7 @@ func (s *streamCore) setRecvTimeout(timeout time.Duration) {
 	s.recvTimeoutNanos.Store(timeout.Nanoseconds())
 }
 
-func (s *streamCore) recvGuard() (func(), error) {
+func (s *Stream) recvGuard() (func(), error) {
 	if !s.recvActive.CompareAndSwap(false, true) {
 		return nil, ErrConcurrentRecv{}
 	}
@@ -190,7 +189,7 @@ func (s *streamCore) recvGuard() (func(), error) {
 	}, nil
 }
 
-func (s *streamCore) recvRaw() (rawMessage, error) {
+func (s *Stream) recvRaw() (rawMessage, error) {
 	release, err := s.recvGuard()
 	if err != nil {
 		return rawMessage{}, err
@@ -205,7 +204,7 @@ func (s *streamCore) recvRaw() (rawMessage, error) {
 	return s.readRaw()
 }
 
-func (s *streamCore) peekWire() (string, error) {
+func (s *Stream) peekWire() (string, error) {
 	msg, err := s.peekRaw()
 	if err != nil {
 		return "", err
@@ -213,7 +212,7 @@ func (s *streamCore) peekWire() (string, error) {
 	return msg.Wire, nil
 }
 
-func (s *streamCore) peekRaw() (rawMessage, error) {
+func (s *Stream) peekRaw() (rawMessage, error) {
 	release, err := s.recvGuard()
 	if err != nil {
 		return rawMessage{}, err
@@ -231,7 +230,7 @@ func (s *streamCore) peekRaw() (rawMessage, error) {
 	return msg, nil
 }
 
-func (s *streamCore) readRaw() (rawMessage, error) {
+func (s *Stream) readRaw() (rawMessage, error) {
 	timeoutNanos := s.recvTimeoutNanos.Load()
 	if timeoutNanos == 0 {
 		select {
@@ -263,7 +262,12 @@ func (s *streamCore) readRaw() (rawMessage, error) {
 	}
 }
 
-func (s *streamCore) sendBoxed(msg Message) error {
+func (s *Stream) sendBoxed(msg Message) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.closed.Load() {
+		return ErrClosed{}
+	}
 	payload, err := s.connection.encodeMessage(msg)
 	if err != nil {
 		s.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
@@ -281,7 +285,7 @@ func (s *streamCore) sendBoxed(msg Message) error {
 	return nil
 }
 
-func (s *streamCore) inboxQ(msg rawMessage) (err error) {
+func (s *Stream) inboxQ(msg rawMessage) (err error) {
 	defer func() {
 		if recover() != nil {
 			err = ErrClosed{}
@@ -295,7 +299,7 @@ func (s *streamCore) inboxQ(msg rawMessage) (err error) {
 	}
 }
 
-func (s *streamCore) incomingQ(payload []byte) (err error) {
+func (s *Stream) incomingQ(payload []byte) (err error) {
 	if s.incoming == nil {
 		return ErrClosed{}
 	}
@@ -312,7 +316,7 @@ func (s *streamCore) incomingQ(payload []byte) (err error) {
 	}
 }
 
-func (s *streamCore) handlerQ(job handlerJob) (err error) {
+func (s *Stream) handlerQ(job handlerJob) (err error) {
 	if s.handlerCh == nil {
 		return ErrClosed{}
 	}
@@ -329,7 +333,7 @@ func (s *streamCore) handlerQ(job handlerJob) (err error) {
 	}
 }
 
-func (s *streamCore) close() bool {
+func (s *Stream) close() bool {
 	closed := false
 	s.closeOnce.Do(func() {
 		closed = true
@@ -345,7 +349,7 @@ func (s *streamCore) close() bool {
 	return closed
 }
 
-func (s *streamCore) protocolError(code, message string) {
+func (s *Stream) protocolError(code, message string) {
 	if code == "" {
 		code = "protocol_error"
 	}
@@ -363,10 +367,10 @@ func (s *streamCore) protocolError(code, message string) {
 		s.debug.protocolErrorReplySendFailure.Add(1)
 		s.connection.debug.protocolErrorReplySendFailure.Add(1)
 	}
-	s.connection.removeStream(s.id)
+	s.Close()
 }
 
-func (s *streamCore) protocolErrorFor(err error) {
+func (s *Stream) protocolErrorFor(err error) {
 	if err == nil {
 		return
 	}
@@ -396,7 +400,7 @@ func isInterfaceType[T any]() bool {
 
 var errorReplyWireName = expectedWireName[*ErrorReply]()
 
-func (s *streamCore) noteDecodeError(err error) {
+func (s *Stream) noteDecodeError(err error) {
 	reason := "decode failed"
 	if err != nil {
 		reason = "decode failed: " + err.Error()
@@ -407,12 +411,12 @@ func (s *streamCore) noteDecodeError(err error) {
 	s.connection.debug.decodeErrors.Add(1)
 }
 
-func (s *streamCore) noteRemoteError() {
+func (s *Stream) noteRemoteError() {
 	s.debug.remoteErrors.Add(1)
 	s.connection.debug.remoteErrors.Add(1)
 }
 
-func (s *streamCore) noteReceivedMessage() {
+func (s *Stream) noteReceivedMessage() {
 	s.debug.dataMessagesReceived.Add(1)
 	s.connection.debug.dataMessagesReceived.Add(1)
 }

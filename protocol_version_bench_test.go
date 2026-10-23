@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-var _ = MustRegisterGlobalType[connTestEchoRequest]()
-var _ = MustRegisterGlobalType[connTestEchoReply]()
+var _ = MustRegister[connTestEchoRequest]()
+var _ = MustRegister[connTestEchoReply]()
 
 func startBenchmarkServer(b *testing.B, server *Server) (string, func()) {
 	b.Helper()
@@ -70,16 +70,16 @@ func benchmarkProtocolSendRecv(b *testing.B, recoveryEnabled bool) {
 	conn.SetRecvTimeout(2 * time.Second)
 
 	// Warm up connection state before timing.
-	if _, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "warmup"}); err != nil {
-		b.Fatalf("warmup SendRecvAs: %v", err)
+	if _, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "warmup"}); err != nil {
+		b.Fatalf("warmup SendRecv: %v", err)
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reply, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "x"})
+		reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "x"})
 		if err != nil {
-			b.Fatalf("SendRecvAs: %v", err)
+			b.Fatalf("SendRecv: %v", err)
 		}
 		if reply.Text != "x" {
 			b.Fatalf("reply got %q want %q", reply.Text, "x")

@@ -8,7 +8,8 @@ import (
 )
 
 // Client configures and dials outbound connections. It uses a builder pattern
-// so options can be chained before calling [Client.Connect]:
+// so options can be chained before calling [Client.Connect] or
+// [Client.SendRecv]:
 //
 //	conn, err := adaptivemsg.NewClient().
 //		WithTimeout(5 * time.Second).
@@ -39,7 +40,9 @@ func NewClient() *Client {
 
 // WithTimeout sets the timeout applied to the TCP dial (or Unix connect) and
 // any subsequent TLS handshake. A zero or negative value disables the timeout,
-// allowing the connection attempt to block indefinitely.
+// allowing the connection attempt to block indefinitely. For
+// [Client.SendRecv], the same timeout also applies while waiting for the
+// reply.
 func (c *Client) WithTimeout(timeout time.Duration) *Client {
 	c.timeout = timeout
 	return c
@@ -106,6 +109,23 @@ func (c *Client) Connect(addr string) (*Connection, error) {
 		return nil, err
 	}
 	return nil, lastErr
+}
+
+// SendRecv dials addr using this client's configuration, sends msg on the
+// default stream, receives a reply of type T, and closes the connection. Use
+// [Client.Connect] when the connection should remain open for reuse.
+func (c *Client) SendRecv[T any](addr string, msg Message) (T, error) {
+	var zero T
+	if c == nil {
+		return zero, ErrInvalidMessage{Reason: "client is nil"}
+	}
+	conn, err := c.Connect(addr)
+	if err != nil {
+		return zero, err
+	}
+	defer conn.Close()
+	conn.SetRecvTimeout(c.timeout)
+	return conn.SendRecv[T](msg)
 }
 
 func (c *Client) connectVersion(addr string, version byte) (*Connection, error) {

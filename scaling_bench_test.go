@@ -44,7 +44,7 @@ func benchmarkScaling(b *testing.B, conns, streamsPerConn int, recoveryEnabled b
 	// Create all connections and streams upfront
 	type streamInfo struct {
 		conn   *Connection
-		stream *Stream[Message]
+		stream *Stream
 	}
 	allStreams := make([]streamInfo, 0, conns*streamsPerConn)
 
@@ -57,13 +57,13 @@ func benchmarkScaling(b *testing.B, conns, streamsPerConn int, recoveryEnabled b
 		conn.SetRecvTimeout(5 * time.Second)
 
 		// Warm up the connection
-		if _, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "warmup"}); err != nil {
+		if _, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "warmup"}); err != nil {
 			b.Fatalf("warmup conn %d: %v", i, err)
 		}
 
 		// Create streams (stream 0 is the default, create additional ones)
 		for j := 0; j < streamsPerConn; j++ {
-			var stream *Stream[Message]
+			var stream *Stream
 			if j == 0 {
 				stream = conn.defaultStream()
 			} else {
@@ -88,16 +88,15 @@ func benchmarkScaling(b *testing.B, conns, streamsPerConn int, recoveryEnabled b
 
 	for idx, si := range allStreams {
 		wg.Add(1)
-		go func(idx int, stream *Stream[Message]) {
+		go func(idx int, stream *Stream) {
 			defer wg.Done()
 			for i := 0; i < opsPerStream; i++ {
-				reply, err := stream.SendRecv(&connTestEchoRequest{Text: "x"})
+				reply, err := stream.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "x"})
 				if err != nil {
 					errors.Add(1)
 					return
 				}
-				echoReply, ok := reply.(*connTestEchoReply)
-				if !ok || echoReply.Text != "x" {
+				if reply.Text != "x" {
 					errors.Add(1)
 					return
 				}
@@ -286,7 +285,7 @@ func runScalingTest(t *testing.T, conns, streamsPerConn, iterations int, recover
 	// Create all connections and streams
 	type streamInfo struct {
 		conn   *Connection
-		stream *Stream[Message]
+		stream *Stream
 	}
 	allStreams := make([]streamInfo, 0, conns*streamsPerConn)
 	allConns := make([]*Connection, 0, conns)
@@ -300,12 +299,12 @@ func runScalingTest(t *testing.T, conns, streamsPerConn, iterations int, recover
 		conn.SetRecvTimeout(5 * time.Second)
 
 		// Warm up
-		if _, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "warmup"}); err != nil {
+		if _, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "warmup"}); err != nil {
 			t.Fatalf("warmup conn %d: %v", i, err)
 		}
 
 		for j := 0; j < streamsPerConn; j++ {
-			var stream *Stream[Message]
+			var stream *Stream
 			if j == 0 {
 				stream = conn.defaultStream()
 			} else {
@@ -335,16 +334,15 @@ func runScalingTest(t *testing.T, conns, streamsPerConn, iterations int, recover
 
 	for _, si := range allStreams {
 		wg.Add(1)
-		go func(stream *Stream[Message]) {
+		go func(stream *Stream) {
 			defer wg.Done()
 			for i := 0; i < opsPerStream; i++ {
-				reply, err := stream.SendRecv(&connTestEchoRequest{Text: "x"})
+				reply, err := stream.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "x"})
 				if err != nil {
 					errors.Add(1)
 					return
 				}
-				echoReply, ok := reply.(*connTestEchoReply)
-				if !ok || echoReply.Text != "x" {
+				if reply.Text != "x" {
 					errors.Add(1)
 					return
 				}

@@ -32,11 +32,10 @@ func (*expectedMsg) WireName() string {
 
 func TestStreamPeekWire(t *testing.T) {
 	conn := &Connection{closeCh: make(chan struct{})}
-	core := &streamCore{
+	stream := &Stream{
 		connection: conn,
 		inbox:      make(chan rawMessage, 1),
 	}
-	stream := &Stream[peekWireMsg]{core: core}
 
 	payload, err := encodeMap(&peekWireMsg{A: "hi"})
 	if err != nil {
@@ -46,7 +45,7 @@ func TestStreamPeekWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
-	core.inbox <- raw
+	stream.inbox <- raw
 
 	wire, err := stream.PeekWire()
 	if err != nil {
@@ -56,7 +55,7 @@ func TestStreamPeekWire(t *testing.T) {
 		t.Fatalf("PeekWire got %q want %q", wire, raw.Wire)
 	}
 
-	msg, err := stream.Recv()
+	msg, err := stream.Recv[peekWireMsg]()
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
@@ -66,15 +65,14 @@ func TestStreamPeekWire(t *testing.T) {
 }
 
 func TestStreamRecvConcurrent(t *testing.T) {
-	core := &streamCore{connection: &Connection{closeCh: make(chan struct{})}}
-	release, err := core.recvGuard()
+	stream := &Stream{connection: &Connection{closeCh: make(chan struct{})}}
+	release, err := stream.recvGuard()
 	if err != nil {
 		t.Fatalf("recvGuard: %v", err)
 	}
 	defer release()
-	stream := &Stream[Message]{core: core}
 
-	_, err = stream.Recv()
+	_, err = stream.Recv[Message]()
 	var concurrent ErrConcurrentRecv
 	if !errors.As(err, &concurrent) {
 		t.Fatalf("expected ErrConcurrentRecv, got %v", err)
@@ -82,14 +80,13 @@ func TestStreamRecvConcurrent(t *testing.T) {
 }
 
 func TestStreamRecvTimeout(t *testing.T) {
-	core := &streamCore{
+	stream := &Stream{
 		connection: &Connection{closeCh: make(chan struct{})},
 		inbox:      make(chan rawMessage),
 	}
-	stream := &Stream[Message]{core: core}
 	stream.SetRecvTimeout(20 * time.Millisecond)
 
-	_, err := stream.Recv()
+	_, err := stream.Recv[Message]()
 	var timeout ErrRecvTimeout
 	if !errors.As(err, &timeout) {
 		t.Fatalf("expected ErrRecvTimeout, got %v", err)
@@ -102,11 +99,10 @@ func TestStreamRecvInterfaceUsesRegistry(t *testing.T) {
 		t.Fatalf("registerTypes: %v", err)
 	}
 	conn := &Connection{registry: reg, closeCh: make(chan struct{})}
-	core := &streamCore{
+	stream := &Stream{
 		connection: conn,
 		inbox:      make(chan rawMessage, 1),
 	}
-	stream := &Stream[Message]{core: core}
 
 	payload, err := encodeMap(&ifaceMsg{A: "hi"})
 	if err != nil {
@@ -116,9 +112,9 @@ func TestStreamRecvInterfaceUsesRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
-	core.inbox <- raw
+	stream.inbox <- raw
 
-	msg, err := stream.Recv()
+	msg, err := stream.Recv[Message]()
 	if err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
@@ -134,11 +130,10 @@ func TestStreamRecvInterfaceUsesRegistry(t *testing.T) {
 func TestStreamRecvInterfaceUnknown(t *testing.T) {
 	reg := newRegistry()
 	conn := &Connection{registry: reg, closeCh: make(chan struct{})}
-	core := &streamCore{
+	stream := &Stream{
 		connection: conn,
 		inbox:      make(chan rawMessage, 1),
 	}
-	stream := &Stream[Message]{core: core}
 
 	payload, err := encodeMap(&ifaceMsg{A: "hi"})
 	if err != nil {
@@ -148,9 +143,9 @@ func TestStreamRecvInterfaceUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
-	core.inbox <- raw
+	stream.inbox <- raw
 
-	_, err = stream.Recv()
+	_, err = stream.Recv[Message]()
 	var unknown ErrUnknownMessage
 	if !errors.As(err, &unknown) {
 		t.Fatalf("expected ErrUnknownMessage, got %v", err)
@@ -164,24 +159,22 @@ func TestStreamTypeMismatchCloses(t *testing.T) {
 		streams:  make(map[uint32]*StreamContext),
 		closeCh:  make(chan struct{}),
 	}
-	core := &streamCore{
+	stream := &Stream{
 		id:         1,
 		connection: conn,
 		inbox:      make(chan rawMessage, 1),
 	}
-	ctx := &StreamContext{stream: &Stream[Message]{core: core}}
-	conn.streams[1] = ctx
-	stream := &Stream[expectedMsg]{core: core}
+	conn.streams[1] = &StreamContext{stream: stream}
 
-	core.inbox <- rawMessage{Wire: "am.test.Other", Codec: CodecMsgpackMap}
-	_, err := stream.Recv()
+	stream.inbox <- rawMessage{Wire: "am.test.Other", Codec: CodecMsgpackMap}
+	_, err := stream.Recv[expectedMsg]()
 	var mismatch ErrTypeMismatch
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("expected ErrTypeMismatch, got %v", err)
 	}
 
 	select {
-	case _, ok := <-core.inbox:
+	case _, ok := <-stream.inbox:
 		if ok {
 			t.Fatalf("expected inbox closed")
 		}

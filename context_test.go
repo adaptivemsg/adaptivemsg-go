@@ -6,24 +6,20 @@ type testCtx struct {
 	Value string
 }
 
-func TestContextAs(t *testing.T) {
+func TestStreamContextState(t *testing.T) {
 	ctx := &StreamContext{}
 	expected := &testCtx{Value: "ok"}
-	ctx.SetContext(expected)
+	ctx.SetState(expected)
 
-	if got := ctx.GetContext(); got != expected {
-		t.Fatalf("GetContext got %v want %v", got, expected)
-	}
-
-	got, ok := ContextAs[*testCtx](ctx)
+	got, ok := ctx.State[*testCtx]()
 	if !ok {
-		t.Fatalf("ContextAs returned false")
+		t.Fatalf("State returned false")
 	}
 	if got != expected {
-		t.Fatalf("ContextAs got %v want %v", got, expected)
+		t.Fatalf("State got %v want %v", got, expected)
 	}
 
-	if _, ok := ContextAs[string](ctx); ok {
-		t.Fatalf("ContextAs for wrong type should return false")
+	if _, ok := ctx.State[string](); ok {
+		t.Fatalf("State for wrong type should return false")
 	}
 }

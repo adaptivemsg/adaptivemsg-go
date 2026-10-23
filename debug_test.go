@@ -40,10 +40,10 @@ func TestConnectionAndStreamDebugState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
-	if err := stream.core.inboxQ(raw); err != nil {
+	if err := stream.inboxQ(raw); err != nil {
 		t.Fatalf("inboxQ: %v", err)
 	}
-	if _, err := stream.Recv(); err != nil {
+	if _, err := stream.Recv[*OkReply](); err != nil {
 		t.Fatalf("Recv: %v", err)
 	}
 
@@ -92,10 +92,10 @@ func TestConnectionDebugFrameCounters(t *testing.T) {
 	conn := newDebugTestConnection(t)
 	var buf bytes.Buffer
 
-	if err := conn.writeFrameTo(&buf, 7, 0, []byte("abc")); err != nil {
+	if err := conn.writeFrameTo(&buf, 7, 0, 0, []byte("abc")); err != nil {
 		t.Fatalf("writeFrameTo: %v", err)
 	}
-	streamID, seq, payload, err := conn.readFrameFrom(&buf)
+	streamID, seq, _, payload, err := conn.readFrameFrom(&buf)
 	if err != nil {
 		t.Fatalf("readFrameFrom: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestStreamAndConnectionLastFailure(t *testing.T) {
 	stream := conn.defaultStream()
 	stream.SetRecvTimeout(5 * time.Millisecond)
 
-	if _, err := stream.Recv(); err == nil {
+	if _, err := stream.Recv[Message](); err == nil {
 		t.Fatal("expected recv timeout")
 	} else {
 		var timeout ErrRecvTimeout

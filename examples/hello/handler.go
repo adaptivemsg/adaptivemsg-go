@@ -29,4 +29,4 @@ func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {
 	}, nil
 }
 
-var _ = am.MustRegisterGlobalType[HelloRequest]()
+var _ = am.MustRegister[HelloRequest]()

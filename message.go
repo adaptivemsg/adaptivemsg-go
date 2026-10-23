@@ -41,7 +41,7 @@ func (*OkReply) WireName() string {
 // returns an error or when an explicit error must be communicated to the
 // peer. Its wire name is "am.message.ErrorReply". On the receiving side an
 // ErrorReply is surfaced as [ErrRemote] by [Stream.SendRecv] and
-// [SendRecvAs].
+// [Connection.SendRecv].
 type ErrorReply struct {
 	Code    string `am:"code"`
 	Message string `am:"message"`

@@ -5,6 +5,8 @@ Go runtime for the adaptivemsg wire protocol.
 This repository is the Go sibling of `adaptivemsg-rust` and is intended to stay
 in lockstep with the protocol defined in `adaptivemsg-doc`.
 
+Requires Go 1.27 or newer.
+
 ## Code generation (amgen-go)
 
 Use `//go:generate go run <module>/cmd/amgen-go` in your `message.go`. `amgen-go` reads
@@ -45,7 +47,7 @@ func (msg *HelloRequest) Handle(_ *am.StreamContext) (am.Message, error) {
 	}, nil
 }
 
-var _ = am.MustRegisterGlobalType[HelloRequest]()
+var _ = am.MustRegister[HelloRequest]()
 
 func main() {
 	// server
@@ -59,9 +61,23 @@ func main() {
 	// client
 	client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
 	conn, _ := client.Connect("tcp://127.0.0.1:5555")
-	reply, _ := am.SendRecvAs[*HelloReply](conn, &HelloRequest{Who: "alice"})
+	reply, _ := conn.SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
 	log.Printf("reply: %s (trace %s)", reply.Answer, reply.Internal.TraceID)
 }
+```
+
+## One-shot request-reply
+
+Use `Client.SendRecv` when the connection should be opened for one exchange
+and closed automatically:
+
+```go
+reply, err := am.NewClient().
+	WithTimeout(5 * time.Second).
+	SendRecv[*HelloReply](
+		"tcp://127.0.0.1:5555",
+		&HelloRequest{Who: "alice"},
+	)
 ```
 
 ## Dynamic receive
@@ -77,15 +93,15 @@ import (
 	"adaptivemsg/examples/echo"
 )
 
-var _ = am.MustRegisterGlobalType[echo.MessageReply]()
-var _ = am.MustRegisterGlobalType[echo.WhoElseEvent]()
+var _ = am.MustRegister[echo.MessageReply]()
+var _ = am.MustRegister[echo.WhoElseEvent]()
 
 func main() {
 	conn, _ := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true}).Connect("tcp://127.0.0.1:5560")
 	stream := conn.NewStream()
 
 	for {
-		msg, err := stream.Recv()
+		msg, err := stream.Recv[am.Message]()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -104,12 +120,11 @@ func main() {
 ## API reference (surface)
 
 Functions:
-- `SendRecvAs`, `StreamAs`, `WireNameOf`, `ContextAs`
-- `RegisterGlobalType`, `MustRegisterGlobalType`
+- `WireNameOf`, `Register`, `MustRegister`
 
 Client:
 - `NewClient`
-- `Client.WithTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithRecovery`, `Client.Connect`
+- `Client.WithTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithRecovery`, `Client.Connect`, `Client.SendRecv[T]`
 
 Server:
 - `NewServer`
@@ -118,13 +133,13 @@ Server:
 
 Connection (default stream view):
 - `Connection.NewStream`, `Connection.Close`, `Connection.WaitClosed`
-- `Connection.Send`, `Connection.SendRecv`, `Connection.Recv`, `Connection.PeekWire`, `Connection.SetRecvTimeout`
+- `Connection.Send`, `Connection.SendRecv[T]`, `Connection.Recv[T]`, `Connection.PeekWire`, `Connection.SetRecvTimeout`
 
 Stream:
-- `Stream[T].Send`, `Stream[T].SendRecv`, `Stream[T].Recv`, `Stream[T].PeekWire`, `Stream[T].SetRecvTimeout`, `Stream[T].ID`, `Stream[T].Close`
+- `Stream.Send`, `Stream.SendRecv[T]`, `Stream.Recv[T]`, `Stream.PeekWire`, `Stream.SetRecvTimeout`, `Stream.ID`, `Stream.Close`
 
 Context:
-- `StreamContext.SetContext`, `StreamContext.GetContext`, `StreamContext.NewTask`
+- `StreamContext.SetState`, `StreamContext.State[T]`, `StreamContext.NewTask`
 
 Codec & messages:
 - `CodecID`, `CodecMsgpackMap`, `CodecMsgpackCompact`, `CodecID.String`, `CodecImpl`
@@ -158,12 +173,13 @@ Notes:
 - Codecs are negotiated from the client's `WithCodecs` preference list; the server selects the first common codec. Defaults are compact-first.
 - Custom codecs implement `CodecImpl` and register with `RegisterCodec`; msgpack struct tags only apply to the msgpack built-ins. `CodecImpl.Encode` transfers ownership of the returned payload to the caller, so codecs must not mutate or reuse that backing storage after return.
 - Compact codec uses positional arrays; nested structs are encoded as arrays when eligible, but types with custom msgpack/binary/text encoders or unexported fields fall back to msgpack's normal encoding (typically maps), so struct tags may still apply there.
-- Connections act as the default stream; use `am.SendRecvAs[Reply](conn, msg)` for one-off calls or `am.StreamAs[Reply](stream)` for a typed view (needed for `Recv`).
-- Register handler/message types with `MustRegisterGlobalType` before `NewClient()`/`NewServer()` so the snapshot sees them.
+- Connections act as the default stream; use `conn.SendRecv[Reply](msg)` for request-reply and `stream.Recv[Message]()` for dynamic receive.
+- Register handler/message types with `MustRegister` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
 - Message names default to `am.<package-leaf>.<TypeName>`; implement `WireName() string` on a type if you need an override.
 - Example servers rely on build-tagged handlers; run them with `-tags server` (for example: `go run -tags server ./examples/hello/cmd/server`).
-- `Stream.Close()` is local-only; there is no on-wire stream close frame.
+- `Stream.Close()` on a stream opened with `NewStream` sends a `FIN` data frame and then releases the local stream. The peer releases its stream after processing that frame. Only the opener sends `FIN`: on a stream opened by the peer, and on stream 0, `Close()` only releases the local stream.
+- Stream IDs are never reused within a connection. After 0xFFFFFFFE streams, `NewStream` returns streams whose operations report `ErrClosed`; open a new connection for further streams.
 
 ## Recovery
 
@@ -204,7 +220,7 @@ metrics.
   - active stream count and per-stream snapshots
   - per-connection counters (frames, bytes, messages, handler activity, recovery activity)
   - last failure code, reason, and timestamp
-- `Stream[T].DebugState()` returns:
+- `Stream.DebugState()` returns:
   - stream queue depths and recv timeout
   - per-stream counters
   - stream-level last failure code, reason, and timestamp
@@ -222,7 +238,7 @@ if err != nil {
 	return
 }
 
-reply, err := am.SendRecvAs[*HelloReply](conn, &HelloRequest{Who: "alice"})
+reply, err := conn.SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
 if err != nil {
 	dbg := conn.DebugState()
 	// log.Printf("sendrecv failed: %+v", dbg)
@@ -243,7 +259,7 @@ For a single stream:
 
 ```go
 stream := conn.NewStream()
-_, err := am.StreamAs[*HelloReply](stream).Recv()
+_, err := stream.Recv[*HelloReply]()
 if err != nil {
 	sdbg := stream.DebugState()
 	log.Printf("stream recv failed: err=%v stream=%d code=%s reason=%s inbox=%d incoming=%d",
@@ -265,7 +281,7 @@ Failure codes are stable strings intended for machine filtering/alerting while
 Common codes include:
 
 - Stream path: `stream.recv_timeout`, `stream.encode`, `stream.enqueue`, `stream.decode`, `stream.protocol`, `stream.protocol_reply_send`
-- Connection path: `connection.reader`, `connection.writer`, `connection.reader_enqueue`, `handler.error`
+- Connection path: `connection.reader`, `connection.writer`, `connection.reader_enqueue`, `connection.stream_ids_exhausted`, `handler.error`
 - Recovery path: `recovery.resume`, `recovery.reconnect_terminal`, `recovery.read`, `recovery.control`, `recovery.data`, `recovery.ack_write`, `recovery.resume_write`, `recovery.live_write`, `recovery.ping_write`
 
 ### Troubleshooting quick map
@@ -281,12 +297,13 @@ Common codes include:
 | `connection.reader` | Base frame read failed | Check network/transport health, frame compatibility, and max-frame settings |
 | `connection.writer` | Base frame write failed | Check peer reachability and connection lifecycle (`Closed`, detach/reconnect state) |
 | `connection.reader_enqueue` | Read frame could not be queued into stream pipeline | Check stream close timing and backpressure symptoms |
+| `connection.stream_ids_exhausted` | The connection has opened 0xFFFFFFFE streams, so `NewStream` now returns closed streams | Open a new connection for new streams; close this one after its remaining streams finish |
 | `handler.error` | Handler returned an application error | Inspect handler logs, input validation, and downstream dependencies |
 | `recovery.resume` | Resume attempt failed but may retry | Check server reachability, attach credentials, and reconnect backoff progression |
 | `recovery.reconnect_terminal` | Resume failed with terminal condition | Check reject reason (`LastFailure`), codec/version mismatch, connection existence |
 | `recovery.read` | Recovery transport read failed | Check heartbeat timeout behavior and transport blackhole symptoms |
 | `recovery.control` | Invalid recovery control frame payload/type | Verify non-Go peer control frame format and control type handling |
-| `recovery.data` | Recovery data frame sequencing/validation failed | Verify monotonic `seq` handling and replay logic |
+| `recovery.data` | Recovery data frame sequencing/validation failed, or a frame header was invalid (unsupported flags, wrong version, or payload above max frame) | Verify monotonic `seq` handling and replay logic; check that the peer only sets supported flags and honors the negotiated max frame |
 | `recovery.ack_write` / `recovery.ping_write` | Control frame write failed during recovery | Check transport stability during idle/control periods |
 | `recovery.resume_write` / `recovery.live_write` | Replay/live data write failed during recovery writer loop | Check transport churn and reconnect cadence |
 

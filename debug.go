@@ -33,6 +33,8 @@ const (
 	DebugFailureReaderLoop DebugFailureCode = "connection.reader"
 	// DebugFailureReaderEnqueue indicates the reader failed to enqueue a payload to a stream.
 	DebugFailureReaderEnqueue DebugFailureCode = "connection.reader_enqueue"
+	// DebugFailureStreamIDsExhausted indicates NewStream ran out of stream IDs.
+	DebugFailureStreamIDsExhausted DebugFailureCode = "connection.stream_ids_exhausted"
 	// DebugFailureReconnectResume indicates a recovery resume attempt failed.
 	DebugFailureReconnectResume DebugFailureCode = "recovery.resume"
 	// DebugFailureReconnectTerminal indicates recovery gave up after exhausting retries.
@@ -266,10 +268,10 @@ func (c *Connection) DebugState() ConnectionDebugState {
 	c.streamsMu.Lock()
 	streams := make([]StreamDebugState, 0, len(c.streams))
 	for _, streamCtx := range c.streams {
-		if streamCtx == nil || streamCtx.stream == nil || streamCtx.stream.core == nil {
+		if streamCtx == nil || streamCtx.stream == nil {
 			continue
 		}
-		streams = append(streams, streamCtx.stream.core.debugState())
+		streams = append(streams, streamCtx.stream.debugState())
 	}
 	streamCount := len(c.streams)
 	c.streamsMu.Unlock()
@@ -297,11 +299,11 @@ func (c *Connection) DebugState() ConnectionDebugState {
 
 // DebugState returns a point-in-time snapshot of this stream's debug
 // counters and state.
-func (s *Stream[T]) DebugState() StreamDebugState {
-	if s == nil || s.core == nil {
+func (s *Stream) DebugState() StreamDebugState {
+	if s == nil {
 		return StreamDebugState{}
 	}
-	return s.core.debugState()
+	return s.debugState()
 }
 
 func (d *connectionDebugCounters) snapshot() ConnectionCounters {
@@ -349,7 +351,7 @@ func (d *streamDebugCounters) snapshot() StreamCounters {
 	}
 }
 
-func (s *streamCore) debugState() StreamDebugState {
+func (s *Stream) debugState() StreamDebugState {
 	if s == nil {
 		return StreamDebugState{}
 	}

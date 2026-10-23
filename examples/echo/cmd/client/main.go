@@ -44,65 +44,59 @@ func main() {
 
 func timeoutDemo(conn *am.Connection) error {
 	stream := conn.NewStream()
-	{
-		stream := am.StreamAs[*am.OkReply](stream)
-		log.Printf("No timeout by default")
-		if _, err := stream.SendRecv(&echo.MessageTimeout{Secs: 10}); err != nil {
-			return err
-		}
-		log.Printf("Recv OK")
-
-		log.Printf("Set timeout to 15s")
-		stream.SetRecvTimeout(15 * time.Second)
-		if _, err := stream.SendRecv(&echo.MessageTimeout{Secs: 10}); err != nil {
-			return err
-		}
-		log.Printf("Recv OK")
-
-		log.Printf("Set timeout to 3s")
-		stream.SetRecvTimeout(3 * time.Second)
-		if _, err := stream.SendRecv(&echo.MessageTimeout{Secs: 10}); err != nil {
-			var timeoutErr am.ErrRecvTimeout
-			if errors.As(err, &timeoutErr) {
-				log.Printf("Recv timeout: %v", err)
-			} else {
-				return err
-			}
-		} else {
-			log.Printf("Some unexpected error happened")
-		}
-
-		log.Printf("Set back to no timeout")
-		stream.SetRecvTimeout(0)
-		if _, err := stream.SendRecv(&echo.MessageTimeout{Secs: 10}); err != nil {
-			return err
-		}
-		log.Printf("Recv OK")
+	log.Printf("No timeout by default")
+	if _, err := stream.SendRecv[*am.OkReply](&echo.MessageTimeout{Secs: 10}); err != nil {
+		return err
 	}
+	log.Printf("Recv OK")
+
+	log.Printf("Set timeout to 15s")
+	stream.SetRecvTimeout(15 * time.Second)
+	if _, err := stream.SendRecv[*am.OkReply](&echo.MessageTimeout{Secs: 10}); err != nil {
+		return err
+	}
+	log.Printf("Recv OK")
+
+	log.Printf("Set timeout to 3s")
+	stream.SetRecvTimeout(3 * time.Second)
+	if _, err := stream.SendRecv[*am.OkReply](&echo.MessageTimeout{Secs: 10}); err != nil {
+		var timeoutErr am.ErrRecvTimeout
+		if errors.As(err, &timeoutErr) {
+			log.Printf("Recv timeout: %v", err)
+		} else {
+			return err
+		}
+	} else {
+		log.Printf("Some unexpected error happened")
+	}
+
+	log.Printf("Set back to no timeout")
+	stream.SetRecvTimeout(0)
+	if _, err := stream.SendRecv[*am.OkReply](&echo.MessageTimeout{Secs: 10}); err != nil {
+		return err
+	}
+	log.Printf("Recv OK")
 	return nil
 }
 
 func whoelseSubscribeDemo(conn *am.Connection) error {
 	stream := conn.NewStream()
-	if _, err := am.SendRecvAs[*am.OkReply](stream, &echo.SubWhoElseEvent{}); err != nil {
+	if _, err := stream.SendRecv[*am.OkReply](&echo.SubWhoElseEvent{}); err != nil {
 		return err
 	}
 
-	{
-		stream := am.StreamAs[*echo.WhoElseEvent](stream)
-		for {
-			evt, err := stream.Recv()
-			if err != nil {
-				return err
-			}
-			log.Printf("event: new client %s", evt.Addr)
+	for {
+		evt, err := stream.Recv[*echo.WhoElseEvent]()
+		if err != nil {
+			return err
 		}
+		log.Printf("event: new client %s", evt.Addr)
 	}
 }
 
 func whoelseQueryDemo(conn *am.Connection) error {
 	for i := 0; i < 100; i++ {
-		rep, err := am.SendRecvAs[*echo.WhoElseReply](conn, &echo.WhoElse{})
+		rep, err := conn.SendRecv[*echo.WhoElseReply](&echo.WhoElse{})
 		if err != nil {
 			return err
 		}
@@ -119,7 +113,7 @@ func echoDemo(conn *am.Connection) error {
 	for i := 0; i < 5; i++ {
 		num += 100
 		req := &echo.MessageRequest{Msg: msg, Num: num}
-		rep, err := am.SendRecvAs[*echo.MessageReply](conn, req)
+		rep, err := conn.SendRecv[*echo.MessageReply](req)
 		if err != nil {
 			return err
 		}
@@ -163,7 +157,7 @@ func concurrentDemo(addr string) error {
 						for k := 0; k < 9; k++ {
 							num += 10
 							req := &echo.MessageRequest{Msg: msg, Num: num}
-							rep, err := am.SendRecvAs[*echo.MessageReply](stream, req)
+							rep, err := stream.SendRecv[*echo.MessageReply](req)
 							if err != nil {
 								reportErr(err)
 								return

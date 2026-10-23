@@ -52,7 +52,7 @@ Handler loop (per stream, if handlers exist):
 
 Recv path:
 - `Recv[T]` pulls raw inbox message, validates wire, decodes on demand.
-- `Recv` on `Stream[Message]` uses registry dynamic decode.
+- `Recv[Message]` uses registry dynamic decode.
 - Unknown wire in dynamic recv returns `ErrUnknownMessage` (no protocol error emitted).
 - `PeekWire()` peeks next wire without decoding.
 
@@ -107,13 +107,13 @@ Protocol error codes:
 
 - Exactly one in-flight `Recv`/`SendRecv` per stream.
 - `SetRecvTimeout(0)` disables timeout.
-- `Stream.Close()` is local only (no on-wire close frame).
-- Stream context is per stream (`SetContext` / `ContextAs`).
+- `Stream.Close()` sends a `FIN` data frame before releasing the local stream, but only on streams this side opened with `NewStream`. Other streams, including stream 0, are released locally.
+- Stream state is per stream (`SetState` / `State[T]`).
 
 ## Current Design Gaps
 
 - Registry snapshot is fixed at client/server construction time.
-- No explicit on-wire stream close.
+- Only the side that opened a stream can close it on the wire; the peer cannot signal that a stream has ended.
 - `maxFrame == 0` rejects all non-empty frames.
 - Recovery includes heartbeat knobs, but no OS keepalive integration.
 

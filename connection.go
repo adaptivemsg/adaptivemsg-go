@@ -11,6 +11,9 @@ import (
 const (
 	streamQueueSize = 1024
 	defaultStreamID = 0
+	// maxStreamID is the last ID NewStream hands out; the only larger value is
+	// controlStreamID.
+	maxStreamID = controlStreamID - 1
 )
 
 type connConfig struct {
@@ -23,6 +26,7 @@ type connConfig struct {
 type outboundFrame struct {
 	streamID uint32
 	seq      uint64
+	flags    FrameFlags
 	payload  []byte
 	queued   chan error
 }
@@ -48,15 +52,16 @@ type Connection struct {
 	conn              net.Conn
 	writer            *bufio.Writer
 	registry          *registry
+	handlersEnabled   bool
 	config            connConfig
 	debug             connectionDebugCounters
 	outbound          chan outboundFrame
 	sendNotify        chan struct{}
 	streams           map[uint32]*StreamContext
 	streamsMu         sync.Mutex
-	nextStreamID      atomic.Uint32
+	nextStreamID      atomic.Uint64
 	defaultStreamOnce sync.Once
-	defaultStreamView *Stream[Message]
+	defaultStreamView *Stream
 	onNewStream       func(*StreamContext)
 	onCloseStream     func(*StreamContext)
 	nextSendSeq       atomic.Uint64
@@ -80,15 +85,16 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 		registry = newRegistrySnapshot()
 	}
 	connection := &Connection{
-		conn:          conn,
-		writer:        bufio.NewWriter(conn),
-		registry:      registry,
-		outbound:      make(chan outboundFrame, streamQueueSize),
-		sendNotify:    make(chan struct{}, 1),
-		streams:       make(map[uint32]*StreamContext),
-		onNewStream:   onNewStream,
-		onCloseStream: onCloseStream,
-		closeCh:       make(chan struct{}),
+		conn:            conn,
+		writer:          bufio.NewWriter(conn),
+		registry:        registry,
+		handlersEnabled: registry.hasHandlers(),
+		outbound:        make(chan outboundFrame, streamQueueSize),
+		sendNotify:      make(chan struct{}, 1),
+		streams:         make(map[uint32]*StreamContext),
+		onNewStream:     onNewStream,
+		onCloseStream:   onCloseStream,
+		closeCh:         make(chan struct{}),
 	}
 	connection.initTransportState()
 	connection.nextStreamID.Store(0)
@@ -155,20 +161,19 @@ func (c *Connection) Send(msg Message) error {
 	return c.defaultStream().Send(msg)
 }
 
-// SendRecv sends msg on the default stream and blocks until a reply arrives,
-// returning the reply as an untyped [Message]. Use the generic helper
-// SendRecvAs for typed replies. Returns [ErrClosed] if the connection closes
-// before a reply is received.
-func (c *Connection) SendRecv(msg Message) (Message, error) {
-	return c.defaultStream().SendRecv(msg)
+// SendRecv sends msg on the default stream and blocks until a reply of type T
+// arrives. It returns [ErrClosed] if the connection closes before a reply is
+// received.
+func (c *Connection) SendRecv[T any](msg Message) (T, error) {
+	return c.defaultStream().SendRecv[T](msg)
 }
 
-// Recv blocks until the next message arrives on the default stream and returns
-// it as an untyped [Message]. It returns [ErrClosed] if the connection closes
-// and [ErrRecvTimeout] if a receive timeout (set via [Connection.SetRecvTimeout])
-// expires before a message arrives.
-func (c *Connection) Recv() (Message, error) {
-	return c.defaultStream().Recv()
+// Recv blocks until the next message arrives on the default stream and decodes
+// it as type T. It returns [ErrClosed] if the connection closes and
+// [ErrRecvTimeout] if a receive timeout (set via
+// [Connection.SetRecvTimeout]) expires before a message arrives.
+func (c *Connection) Recv[T any]() (T, error) {
+	return c.defaultStream().Recv[T]()
 }
 
 // PeekWire returns the wire name of the next message on the default stream
@@ -185,32 +190,45 @@ func (c *Connection) SetRecvTimeout(timeout time.Duration) {
 	c.defaultStream().SetRecvTimeout(timeout)
 }
 
-func (c *Connection) viewCore() *streamCore {
-	if c == nil {
-		return nil
+func (c *Connection) streamForID(streamID uint32) *Stream {
+	if streamCtx := c.getStreamCtx(streamID, false); streamCtx != nil {
+		return streamCtx.stream
 	}
-	return c.defaultStream().core
-}
-
-func (*Connection) isLink() {}
-
-func (c *Connection) streamForID(streamID uint32) *streamCore {
-	streamCtx := c.getStreamCtx(streamID)
-	return streamCtx.stream.core
+	return &Stream{id: streamID, connection: c}
 }
 
 // NewStream allocates a new stream ID and returns a [Stream] view scoped to
 // that ID. Streams provide independent, multiplexed message channels over the
 // same underlying connection. All streams are automatically closed when the
 // parent Connection is closed.
-func (c *Connection) NewStream() *Stream[Message] {
+//
+// Stream IDs are never reused, so a connection can open at most 0xFFFFFFFE
+// streams. After that, NewStream returns a stream whose operations report
+// [ErrClosed], and [Connection.DebugState] reports
+// [DebugFailureStreamIDsExhausted]. Open a new connection for further streams.
+func (c *Connection) NewStream() *Stream {
 	streamID := c.nextStreamID.Add(1)
-	return &Stream[Message]{core: c.streamForID(streamID)}
+	if streamID > uint64(maxStreamID) {
+		c.debug.noteFailure(DebugFailureStreamIDsExhausted, "stream IDs exhausted")
+		return closedStream(c)
+	}
+	return c.streamForID(uint32(streamID))
 }
 
-func (c *Connection) defaultStream() *Stream[Message] {
+// closedStream returns a stream that is not registered on c and reports
+// ErrClosed from every operation. Its ID is controlStreamID rather than 0
+// because closing stream 0 would remove the default stream.
+func closedStream(c *Connection) *Stream {
+	inbox := make(chan rawMessage)
+	close(inbox)
+	s := &Stream{id: controlStreamID, connection: c, inbox: inbox}
+	s.closed.Store(true)
+	return s
+}
+
+func (c *Connection) defaultStream() *Stream {
 	c.defaultStreamOnce.Do(func() {
-		c.defaultStreamView = &Stream[Message]{core: c.streamForID(defaultStreamID)}
+		c.defaultStreamView = c.streamForID(defaultStreamID)
 	})
 	return c.defaultStreamView
 }
@@ -233,7 +251,7 @@ func (c *Connection) closeAllStreams() {
 	c.streams = make(map[uint32]*StreamContext)
 	c.streamsMu.Unlock()
 	for _, streamCtx := range streams {
-		if streamCtx.stream.core.close() {
+		if streamCtx.stream.close() {
 			c.debug.streamsClosed.Add(1)
 		}
 		if c.onCloseStream != nil {
@@ -251,10 +269,10 @@ func (c *Connection) removeStream(streamID uint32) {
 		return
 	}
 	// Promote stream failure to connection so it survives stream removal.
-	if code := streamCtx.stream.core.debug.lastFailureCode(); code != DebugFailureNone {
-		c.debug.noteFailure(code, streamCtx.stream.core.debug.lastFailureReason())
+	if code := streamCtx.stream.debug.lastFailureCode(); code != DebugFailureNone {
+		c.debug.noteFailure(code, streamCtx.stream.debug.lastFailureReason())
 	}
-	if streamCtx.stream.core.close() {
+	if streamCtx.stream.close() {
 		c.debug.streamsClosed.Add(1)
 	}
 	if c.onCloseStream != nil {
@@ -262,87 +280,104 @@ func (c *Connection) removeStream(streamID uint32) {
 	}
 }
 
-func (c *Connection) getStreamCtx(streamID uint32) *StreamContext {
+// openedStream reports whether NewStream on this side allocated streamID.
+func (c *Connection) openedStream(streamID uint32) bool {
+	return streamID != defaultStreamID && uint64(streamID) <= c.nextStreamID.Load()
+}
+
+// getStreamCtx returns the stream for streamID, creating it if needed. It
+// returns nil if the connection is closed, or if inbound is set and the frame
+// belongs to a stream this side allocated and already closed.
+func (c *Connection) getStreamCtx(streamID uint32, inbound bool) *StreamContext {
 	c.streamsMu.Lock()
-	streamCtx, ok := c.streams[streamID]
-	if ok {
+	if c.closed.Load() {
+		c.streamsMu.Unlock()
+		return nil
+	}
+	if streamCtx, ok := c.streams[streamID]; ok {
 		c.streamsMu.Unlock()
 		return streamCtx
 	}
-	streamCtx = c.makeStreamLocked(streamID)
+	// Stream IDs are never reused, so a missing stream that this side opened
+	// was closed on this side.
+	if inbound && c.openedStream(streamID) {
+		c.streamsMu.Unlock()
+		return nil
+	}
+	streamCtx := c.newStreamCtx(streamID)
+	c.streams[streamID] = streamCtx
+	c.debug.streamsOpened.Add(1)
 	c.streamsMu.Unlock()
+
+	c.startStream(streamCtx)
 	if c.onNewStream != nil {
 		c.onNewStream(streamCtx)
 	}
 	return streamCtx
 }
 
-func (c *Connection) makeStreamLocked(streamID uint32) *StreamContext {
-	inbox := make(chan rawMessage, streamQueueSize)
-	incoming := make(chan []byte, streamQueueSize)
+func (c *Connection) newStreamCtx(streamID uint32) *StreamContext {
 	var handlerCh chan handlerJob
-	if c.registry.hasHandlers() {
+	if c.handlersEnabled {
 		handlerCh = make(chan handlerJob, streamQueueSize)
 	}
-	core := &streamCore{
-		id:         streamID,
-		connection: c,
-		inbox:      inbox,
-		incoming:   incoming,
-		handlerCh:  handlerCh,
+	return &StreamContext{
+		stream: &Stream{
+			id:         streamID,
+			connection: c,
+			inbox:      make(chan rawMessage, streamQueueSize),
+			incoming:   make(chan []byte, streamQueueSize),
+			handlerCh:  handlerCh,
+		},
 	}
-	stream := &Stream[Message]{core: core}
-	streamCtx := &StreamContext{
-		stream: stream,
-	}
-	c.streams[streamID] = streamCtx
-	c.debug.streamsOpened.Add(1)
-	if handlerCh != nil {
+}
+
+func (c *Connection) startStream(streamCtx *StreamContext) {
+	if streamCtx.stream.handlerCh != nil {
 		go c.handlerLoop(streamCtx)
 	}
 	go c.decodeLoop(streamCtx)
-	return streamCtx
 }
 
 func (c *Connection) handlerLoop(streamCtx *StreamContext) {
-	core := streamCtx.stream.core
-	for job := range core.handlerCh {
-		core.debug.handlerCalls.Add(1)
+	stream := streamCtx.stream
+	for job := range stream.handlerCh {
+		stream.debug.handlerCalls.Add(1)
 		c.debug.handlerCalls.Add(1)
 		reply, err := job.handler(streamCtx, job.msg)
 		if err != nil {
-			core.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
+			stream.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
 			c.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
-			core.debug.handlerErrors.Add(1)
+			stream.debug.handlerErrors.Add(1)
 			c.debug.handlerErrors.Add(1)
-			_ = core.sendBoxed(NewErrorReply("handler_error", err.Error()))
+			_ = stream.sendBoxed(NewErrorReply("handler_error", err.Error()))
 			continue
 		}
 		if reply == nil {
-			_ = core.sendBoxed(&OkReply{})
+			_ = stream.sendBoxed(&OkReply{})
 			continue
 		}
-		_ = core.sendBoxed(reply)
+		_ = stream.sendBoxed(reply)
 	}
 }
 
 func (c *Connection) decodeLoop(streamCtx *StreamContext) {
-	core := streamCtx.stream.core
+	stream := streamCtx.stream
 	for {
 		select {
-		case payload, ok := <-core.incoming:
+		case payload, ok := <-stream.incoming:
 			if !ok {
 				return
 			}
 			raw, err := newRawMessageFromPayload(c.config.codecID, payload)
 			if err != nil {
-				core.noteDecodeError(err)
-				core.protocolError("codec_error", err.Error())
+				stream.noteDecodeError(err)
+				stream.protocolError("codec_error", err.Error())
 				return
 			}
-			if err := c.dispatchMessage(core, raw); err != nil {
-				core.noteDecodeError(err)
-				core.protocolError("codec_error", err.Error())
+			if err := c.dispatchMessage(stream, raw); err != nil {
+				stream.noteDecodeError(err)
+				stream.protocolError("codec_error", err.Error())
 				return
 			}
 		case <-c.closeCh:
@@ -351,7 +386,7 @@ func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 	}
 }
 
-func (c *Connection) dispatchMessage(stream *streamCore, raw rawMessage) error {
+func (c *Connection) dispatchMessage(stream *Stream, raw rawMessage) error {
 	if handler, ok := c.registry.handler(raw.Wire); ok {
 		msg, err := decodeRawWithRegistry(raw, c.registry)
 		if err != nil {
@@ -385,7 +420,7 @@ func (c *Connection) writerLoop() {
 		case <-c.closeCh:
 			return
 		case frame := <-c.outbound:
-			if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.payload); err != nil {
+			if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
 				c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 				c.markClosed()
 				return
@@ -396,7 +431,7 @@ func (c *Connection) writerLoop() {
 		for drain {
 			select {
 			case frame := <-c.outbound:
-				if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.payload); err != nil {
+				if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 					c.markClosed()
 					return
@@ -420,19 +455,46 @@ func (c *Connection) readerLoop() {
 		return
 	}
 	for {
-		streamID, _, payload, err := c.readFrame()
+		streamID, _, flags, payload, err := c.readFrame()
 		if err != nil {
 			c.debug.noteFailure(DebugFailureReaderLoop, "reader loop failed: "+err.Error())
 			c.markClosed()
 			return
 		}
-		streamCtx := c.getStreamCtx(streamID)
-		if err := streamCtx.stream.core.incomingQ(payload); err != nil {
+		if err := c.acceptFrame(streamID, flags, payload); err != nil {
 			c.debug.noteFailure(DebugFailureReaderEnqueue, "reader enqueue failed: "+err.Error())
 			c.markClosed()
 			return
 		}
 	}
+}
+
+func (c *Connection) acceptFrame(streamID uint32, flags FrameFlags, payload []byte) error {
+	fin := flags&FrameFlagFIN != 0 && streamID != defaultStreamID && streamID != controlStreamID
+	if fin && len(payload) == 0 {
+		c.removeStream(streamID)
+		return nil
+	}
+	streamCtx := c.getStreamCtx(streamID, true)
+	if streamCtx == nil {
+		if c.closed.Load() {
+			return ErrClosed{}
+		}
+		return nil
+	}
+	if len(payload) > 0 {
+		if err := streamCtx.stream.incomingQ(payload); err != nil {
+			if c.closed.Load() {
+				return err
+			}
+			// The stream was closed after the lookup; drop the frame.
+			return nil
+		}
+	}
+	if fin {
+		c.removeStream(streamID)
+	}
+	return nil
 }
 
 func (c *Connection) encodeMessage(msg Message) ([]byte, error) {

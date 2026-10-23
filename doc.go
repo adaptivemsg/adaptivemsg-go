@@ -64,7 +64,8 @@
 //	if err != nil { log.Fatal(err) }
 //	defer conn.Close()
 //
-//	reply, err := adaptivemsg.SendRecvAs[*Pong](conn, &Ping{Text: "hello"})
+//	reply, err := conn.SendRecv[*Pong](&Ping{Text: "hello"})
 //
-// For one-shot request/reply without keeping a connection open, see [Once].
+// For one-shot request/reply without keeping a connection open, see
+// [Client.SendRecv].
 package adaptivemsg

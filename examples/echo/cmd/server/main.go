@@ -37,7 +37,7 @@ func main() {
 			return nil
 		}).
 		OnNewStream(func(ctx *am.StreamContext) {
-			ctx.SetContext(mgr)
+			ctx.SetState(mgr)
 			id := streamSeq.Add(1)
 			log.Printf("on new stream: %d", id)
 		})

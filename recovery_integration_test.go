@@ -1,15 +1,17 @@
 package adaptivemsg
 
 import (
+	"encoding/binary"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-var _ = MustRegisterGlobalType[connTestEchoRequest]()
-var _ = MustRegisterGlobalType[connTestEchoReply]()
-var _ = MustRegisterGlobalType[connTestErrRequest]()
-var _ = MustRegisterGlobalType[recoveryDropReplyRequest]()
+var _ = MustRegister[connTestEchoRequest]()
+var _ = MustRegister[connTestEchoReply]()
+var _ = MustRegister[connTestErrRequest]()
+var _ = MustRegister[recoveryDropReplyRequest]()
 
 type recoveryDropReplyRequest struct {
 	Text string `am:"text"`
@@ -23,7 +25,7 @@ var recoveryDropReplyOnce atomic.Bool
 
 func (r *recoveryDropReplyRequest) Handle(ctx *StreamContext) (Message, error) {
 	if recoveryDropReplyOnce.CompareAndSwap(false, true) {
-		_ = ctx.stream.core.connection.currentTransportForTest().Close()
+		_ = ctx.stream.connection.currentTransportForTest().Close()
 	}
 	return &connTestEchoReply{Text: r.Text}, nil
 }
@@ -151,7 +153,7 @@ func startRecoveryHeartbeatBlackholeServer(t *testing.T, opts ServerRecoveryOpti
 		go func() {
 			wire := &Connection{config: firstCfg}
 			for {
-				_, _, _, err := wire.readFrameFrom(firstConn)
+				_, _, _, _, err := wire.readFrameFrom(firstConn)
 				if err != nil {
 					_ = firstConn.Close()
 					return
@@ -192,7 +194,7 @@ func startRecoveryHeartbeatBlackholeServer(t *testing.T, opts ServerRecoveryOpti
 
 		wire := &Connection{config: secondCfg}
 		for {
-			streamID, _, payload, err := wire.readFrameFrom(secondConn)
+			streamID, _, _, payload, err := wire.readFrameFrom(secondConn)
 			if err != nil {
 				_ = secondConn.Close()
 				return
@@ -219,6 +221,88 @@ func startRecoveryHeartbeatBlackholeServer(t *testing.T, opts ServerRecoveryOpti
 	return listener.Addr().String(), resumed, stop
 }
 
+func startRecoveryRawFrameServer(t *testing.T, maxFrame uint32, raw []byte) string {
+	t.Helper()
+	listener, err := listenTCP("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := handshakeServer(conn, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, maxFrame, true); err != nil {
+			return
+		}
+		if _, err := readAttachRequest(conn); err != nil {
+			return
+		}
+		connectionID, err := newRecoveryToken()
+		if err != nil {
+			return
+		}
+		resumeSecret, err := newRecoveryToken()
+		if err != nil {
+			return
+		}
+		if err := writeAttachResponse(conn, attachResponse{
+			status:       attachStatusOK,
+			connectionID: connectionID,
+			resumeSecret: resumeSecret,
+			negotiated:   recoveryTestServerOptions().negotiated(),
+		}); err != nil {
+			return
+		}
+		if err := writeFull(conn, raw); err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	return listener.Addr().String()
+}
+
+func TestRecoveryMalformedFrameClosesConnection(t *testing.T) {
+	const maxFrame = 64
+	cases := []struct {
+		name       string
+		version    byte
+		flags      FrameFlags
+		payloadLen uint32
+	}{
+		{"unsupported flags", protocolVersionV3, FrameFlagMeta, 1},
+		{"wrong version", protocolVersionV2, 0, 1},
+		{"oversized payload", protocolVersionV3, 0, maxFrame + 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			header := make([]byte, frameHeaderLenV3)
+			header[0] = tc.version
+			header[1] = byte(tc.flags)
+			binary.BigEndian.PutUint32(header[2:6], 1)
+			binary.BigEndian.PutUint32(header[6:10], tc.payloadLen)
+			binary.BigEndian.PutUint64(header[10:18], 1)
+			addr := startRecoveryRawFrameServer(t, maxFrame, header)
+
+			conn, err := NewClient().WithRecovery(recoveryTestClientOptions()).Connect("tcp://" + addr)
+			if err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			defer conn.Close()
+
+			waitForCondition(t, 2*time.Second, func() bool {
+				return conn.DebugState().Closed
+			})
+			if got := conn.DebugState().LastFailureCode; got != DebugFailureRecoveryData {
+				t.Fatalf("last failure got %q want %q", got, DebugFailureRecoveryData)
+			}
+		})
+	}
+}
+
 func TestRecoverySendRecvAfterReconnect(t *testing.T) {
 	clientOpts := recoveryTestClientOptions()
 	serverOpts := recoveryTestServerOptions()
@@ -234,9 +318,9 @@ func TestRecoverySendRecvAfterReconnect(t *testing.T) {
 	defer conn.Close()
 	conn.SetRecvTimeout(2 * time.Second)
 
-	reply, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "first"})
+	reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "first"})
 	if err != nil {
-		t.Fatalf("first SendRecvAs: %v", err)
+		t.Fatalf("first SendRecv: %v", err)
 	}
 	if reply.Text != "first" {
 		t.Fatalf("first reply got %q want %q", reply.Text, "first")
@@ -248,9 +332,9 @@ func TestRecoverySendRecvAfterReconnect(t *testing.T) {
 	}
 	_ = transport.Close()
 
-	reply, err = SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "second"})
+	reply, err = conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "second"})
 	if err != nil {
-		t.Fatalf("second SendRecvAs: %v", err)
+		t.Fatalf("second SendRecv: %v", err)
 	}
 	if reply.Text != "second" {
 		t.Fatalf("second reply got %q want %q", reply.Text, "second")
@@ -274,17 +358,17 @@ func TestRecoveryReplaysReplyAfterTransportBreak(t *testing.T) {
 	defer conn.Close()
 	conn.SetRecvTimeout(2 * time.Second)
 
-	reply, err := SendRecvAs[*connTestEchoReply](conn, &recoveryDropReplyRequest{Text: "replayed"})
+	reply, err := conn.SendRecv[*connTestEchoReply](&recoveryDropReplyRequest{Text: "replayed"})
 	if err != nil {
-		t.Fatalf("SendRecvAs with dropped reply: %v", err)
+		t.Fatalf("SendRecv with dropped reply: %v", err)
 	}
 	if reply.Text != "replayed" {
 		t.Fatalf("reply got %q want %q", reply.Text, "replayed")
 	}
 
-	reply, err = SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "after"})
+	reply, err = conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "after"})
 	if err != nil {
-		t.Fatalf("follow-up SendRecvAs: %v", err)
+		t.Fatalf("follow-up SendRecv: %v", err)
 	}
 	if reply.Text != "after" {
 		t.Fatalf("follow-up reply got %q want %q", reply.Text, "after")
@@ -312,9 +396,9 @@ func TestRecoveryQueuesSendWhileDetached(t *testing.T) {
 	}
 	_ = transport.Close()
 
-	reply, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "queued"})
+	reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "queued"})
 	if err != nil {
-		t.Fatalf("queued SendRecvAs: %v", err)
+		t.Fatalf("queued SendRecv: %v", err)
 	}
 	if reply.Text != "queued" {
 		t.Fatalf("reply got %q want %q", reply.Text, "queued")
@@ -347,9 +431,9 @@ func TestRecoveryHeartbeatKeepsIdleConnectionAlive(t *testing.T) {
 		t.Fatal("expected idle heartbeat to keep the same transport alive")
 	}
 
-	reply, err := SendRecvAs[*connTestEchoReply](conn, &connTestEchoRequest{Text: "idle-ok"})
+	reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "idle-ok"})
 	if err != nil {
-		t.Fatalf("SendRecvAs after idle: %v", err)
+		t.Fatalf("SendRecv after idle: %v", err)
 	}
 	if reply.Text != "idle-ok" {
 		t.Fatalf("reply got %q want %q", reply.Text, "idle-ok")

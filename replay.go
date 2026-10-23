@@ -8,6 +8,7 @@ import (
 type frameRecord struct {
 	streamID uint32
 	seq      uint64
+	flags    FrameFlags
 	payload  []byte
 	size     int64
 }
@@ -37,6 +38,7 @@ func (b *replayBuffer) add(frame outboundFrame) (*frameRecord, error) {
 		return &frameRecord{
 			streamID: frame.streamID,
 			seq:      frame.seq,
+			flags:    frame.flags,
 			payload:  frame.payload,
 		}, nil
 	}
@@ -65,6 +67,7 @@ func (b *replayBuffer) add(frame outboundFrame) (*frameRecord, error) {
 	record := &frameRecord{
 		streamID: frame.streamID,
 		seq:      frame.seq,
+		flags:    frame.flags,
 		payload:  frame.payload,
 		size:     size,
 	}

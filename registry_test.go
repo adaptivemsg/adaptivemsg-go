@@ -15,14 +15,14 @@ func (*testHandlerMsg) Handle(*StreamContext) (Message, error) {
 	return &OkReply{}, nil
 }
 
-func TestRegisterGlobalTypeRegistersHandler(t *testing.T) {
+func TestRegisterRegistersHandler(t *testing.T) {
 	orig := globalRegistry
 	globalRegistry = newRegistry()
 	t.Cleanup(func() {
 		globalRegistry = orig
 	})
-	if err := RegisterGlobalType[testHandlerMsg](); err != nil {
-		t.Fatalf("RegisterGlobalType: %v", err)
+	if err := Register[testHandlerMsg](); err != nil {
+		t.Fatalf("Register: %v", err)
 	}
 	wire, err := WireNameOf(&testHandlerMsg{})
 	if err != nil {
@@ -33,13 +33,13 @@ func TestRegisterGlobalTypeRegistersHandler(t *testing.T) {
 	}
 }
 
-func TestRegisterGlobalTypeInvalid(t *testing.T) {
+func TestRegisterInvalid(t *testing.T) {
 	orig := globalRegistry
 	globalRegistry = newRegistry()
 	t.Cleanup(func() {
 		globalRegistry = orig
 	})
-	err := RegisterGlobalType[int]()
+	err := Register[int]()
 	if err == nil {
 		t.Fatalf("expected error")
 	}

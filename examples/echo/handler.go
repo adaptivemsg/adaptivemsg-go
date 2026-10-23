@@ -25,7 +25,7 @@ func (msg *MessageRequest) Handle(ctx *am.StreamContext) (am.Message, error) {
 	}, nil
 }
 
-var _ = am.MustRegisterGlobalType[MessageRequest]()
+var _ = am.MustRegister[MessageRequest]()
 
 func (msg *SubWhoElseEvent) Handle(ctx *am.StreamContext) (am.Message, error) {
 	mgr, err := statFromContext(ctx)
@@ -33,7 +33,7 @@ func (msg *SubWhoElseEvent) Handle(ctx *am.StreamContext) (am.Message, error) {
 		return nil, err
 	}
 	rx := mgr.Subscribe()
-	if err := ctx.NewTask(func(stream *am.Stream[am.Message]) {
+	if err := ctx.NewTask(func(stream *am.Stream) {
 		defer mgr.Unsubscribe(rx)
 		for addr := range rx {
 			if err := stream.Send(&WhoElseEvent{Addr: addr}); err != nil {
@@ -47,7 +47,7 @@ func (msg *SubWhoElseEvent) Handle(ctx *am.StreamContext) (am.Message, error) {
 	return nil, nil
 }
 
-var _ = am.MustRegisterGlobalType[SubWhoElseEvent]()
+var _ = am.MustRegister[SubWhoElseEvent]()
 
 func (msg *WhoElse) Handle(ctx *am.StreamContext) (am.Message, error) {
 	mgr, err := statFromContext(ctx)
@@ -57,17 +57,17 @@ func (msg *WhoElse) Handle(ctx *am.StreamContext) (am.Message, error) {
 	return &WhoElseReply{Clients: mgr.ListClients()}, nil
 }
 
-var _ = am.MustRegisterGlobalType[WhoElse]()
+var _ = am.MustRegister[WhoElse]()
 
 func (msg *MessageTimeout) Handle(_ *am.StreamContext) (am.Message, error) {
 	time.Sleep(time.Duration(msg.Secs) * time.Second)
 	return nil, nil
 }
 
-var _ = am.MustRegisterGlobalType[MessageTimeout]()
+var _ = am.MustRegister[MessageTimeout]()
 
 func statFromContext(ctx *am.StreamContext) (*StatMgr, error) {
-	mgr, ok := am.ContextAs[*StatMgr](ctx)
+	mgr, ok := ctx.State[*StatMgr]()
 	if !ok || mgr == nil {
 		return nil, errors.New("missing stream context")
 	}

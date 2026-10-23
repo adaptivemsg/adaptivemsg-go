@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func startOnceTestServer(t *testing.T) (string, func()) {
+func startClientSendRecvTestServer(t *testing.T) (string, func()) {
 	t.Helper()
 	server := NewServer()
 	listener, err := listenTCP("127.0.0.1:0")
@@ -34,43 +34,44 @@ func startOnceTestServer(t *testing.T) (string, func()) {
 	return listener.Addr().String(), stop
 }
 
-func TestOnceSendRecvAs(t *testing.T) {
-	addr, stop := startOnceTestServer(t)
+func TestClientSendRecv(t *testing.T) {
+	addr, stop := startClientSendRecvTestServer(t)
 	defer stop()
 
-	reply, err := SendRecvAs[*connTestEchoReply](
-		Once("tcp://"+addr),
+	reply, err := NewClient().WithTimeout(5 * time.Second).SendRecv[*connTestEchoReply](
+		"tcp://"+addr,
 		&connTestEchoRequest{Text: "hello"},
 	)
 	if err != nil {
-		t.Fatalf("SendRecvAs with Once: %v", err)
+		t.Fatalf("Client.SendRecv: %v", err)
 	}
 	if reply.Text != "hello" {
 		t.Fatalf("reply got %q want %q", reply.Text, "hello")
 	}
 }
 
-func TestOnceSendRecvAsWithOptions(t *testing.T) {
-	addr, stop := startOnceTestServer(t)
+func TestClientSendRecvWithOptions(t *testing.T) {
+	addr, stop := startClientSendRecvTestServer(t)
 	defer stop()
 
-	reply, err := SendRecvAs[*connTestEchoReply](
-		Once("tcp://"+addr).
-			WithTimeout(5*time.Second).
-			WithCodecs(CodecMsgpackCompact),
+	reply, err := NewClient().
+		WithTimeout(5 * time.Second).
+		WithCodecs(CodecMsgpackCompact).
+		SendRecv[*connTestEchoReply](
+		"tcp://"+addr,
 		&connTestEchoRequest{Text: "options"},
 	)
 	if err != nil {
-		t.Fatalf("SendRecvAs with Once options: %v", err)
+		t.Fatalf("Client.SendRecv with options: %v", err)
 	}
 	if reply.Text != "options" {
 		t.Fatalf("reply got %q want %q", reply.Text, "options")
 	}
 }
 
-func TestOnceSendRecvAsConnectFailure(t *testing.T) {
-	_, err := SendRecvAs[*connTestEchoReply](
-		Once("tcp://127.0.0.1:1"),
+func TestClientSendRecvConnectFailure(t *testing.T) {
+	_, err := NewClient().WithTimeout(time.Second).SendRecv[*connTestEchoReply](
+		"tcp://127.0.0.1:1",
 		&connTestEchoRequest{Text: "fail"},
 	)
 	if err == nil {
@@ -78,9 +79,13 @@ func TestOnceSendRecvAsConnectFailure(t *testing.T) {
 	}
 }
 
-func TestOnceSendRecvAsNilLink(t *testing.T) {
-	_, err := SendRecvAs[*connTestEchoReply](nil, &connTestEchoRequest{Text: "nil"})
+func TestClientSendRecvNil(t *testing.T) {
+	var client *Client
+	_, err := client.SendRecv[*connTestEchoReply](
+		"tcp://127.0.0.1:1",
+		&connTestEchoRequest{Text: "nil"},
+	)
 	if err == nil {
-		t.Fatalf("expected error for nil link")
+		t.Fatalf("expected error for nil Client")
 	}
 }

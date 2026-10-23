@@ -507,7 +507,7 @@ func (c *Connection) recoveryWriterLoop() {
 			}
 			if _, ackSeq, ok := c.recovery.takePendingControl(); ok {
 				payload := buildAckControlPayload(ackSeq)
-				if err := c.writeFrameNoFlush(bw, controlStreamID, 0, payload); err != nil {
+				if err := c.writeFrameNoFlush(bw, controlStreamID, 0, 0, payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery ack write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -516,7 +516,7 @@ func (c *Connection) recoveryWriterLoop() {
 				select {
 				case frame := <-c.outbound:
 					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-						if err := c.writeFrameNoFlush(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+						if err := c.writeFrameNoFlush(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 							c.handleRecoveryTransportError(conn)
 							lostTransport = true
@@ -542,7 +542,7 @@ func (c *Connection) recoveryWriterLoop() {
 				if resumeFrame.seq <= lastSentSeq || resumeFrame.seq <= c.recovery.replay.lastAckedSeq() {
 					continue
 				}
-				if err := c.writeFrameTo(bw, resumeFrame.streamID, resumeFrame.seq, resumeFrame.payload); err != nil {
+				if err := c.writeFrameTo(bw, resumeFrame.streamID, resumeFrame.seq, resumeFrame.flags, resumeFrame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryResumeWrite, "recovery resume write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -564,7 +564,7 @@ func (c *Connection) recoveryWriterLoop() {
 				if stored.seq <= lastSentSeq {
 					continue
 				}
-				if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+				if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -585,7 +585,7 @@ func (c *Connection) recoveryWriterLoop() {
 				case <-c.sendNotify:
 				case frame := <-c.outbound:
 					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 							c.handleRecoveryTransportError(conn)
 							lostTransport = true
@@ -616,7 +616,7 @@ func (c *Connection) recoveryWriterLoop() {
 			case frame := <-c.outbound:
 				stopAndDrain()
 				if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-					if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.payload); err != nil {
+					if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
 						c.handleRecoveryTransportError(conn)
 						lostTransport = true
@@ -632,7 +632,7 @@ func (c *Connection) recoveryWriterLoop() {
 				break
 			}
 			if timerFired && wait == heartbeatWait {
-				if err := c.writeFrameTo(bw, controlStreamID, 0, buildPingControlPayload()); err != nil {
+				if err := c.writeFrameTo(bw, controlStreamID, 0, 0, buildPingControlPayload()); err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryPingWrite, "recovery ping write failed: "+err.Error())
 					c.handleRecoveryTransportError(conn)
 					break
@@ -656,8 +656,14 @@ func (c *Connection) recoveryReaderLoop() {
 				break
 			}
 			c.recovery.armReadDeadline(conn)
-			streamID, seq, payload, err := c.readFrameFrom(conn)
+			streamID, seq, flags, payload, err := c.readFrameFrom(conn)
 			if err != nil {
+				// Resuming would replay the same frame, so a malformed frame is terminal.
+				if isMalformedFrameError(err) {
+					c.debug.noteFailure(DebugFailureRecoveryData, "recovery frame rejected: "+err.Error())
+					c.markClosed()
+					return
+				}
 				c.debug.noteFailure(DebugFailureRecoveryRead, "recovery read failed: "+err.Error())
 				c.handleRecoveryTransportError(conn)
 				break
@@ -671,7 +677,10 @@ func (c *Connection) recoveryReaderLoop() {
 				}
 				continue
 			}
-			if err := c.handleRecoveryDataFrame(streamID, seq, payload); err != nil {
+			if err := c.handleRecoveryDataFrame(streamID, seq, flags, payload); err != nil {
+				if c.closed.Load() {
+					return
+				}
 				c.debug.noteFailure(DebugFailureRecoveryData, "recovery data frame failed: "+err.Error())
 				c.markClosed()
 				return
@@ -698,7 +707,7 @@ func (c *Connection) handleControlFrame(payload []byte) error {
 	}
 }
 
-func (c *Connection) handleRecoveryDataFrame(streamID uint32, seq uint64, payload []byte) error {
+func (c *Connection) handleRecoveryDataFrame(streamID uint32, seq uint64, flags FrameFlags, payload []byte) error {
 	if seq == 0 {
 		return ErrInvalidMessage{Reason: "recovery data frame missing seq"}
 	}
@@ -710,9 +719,7 @@ func (c *Connection) handleRecoveryDataFrame(streamID uint32, seq uint64, payloa
 	if seq != lastRecvSeq+1 {
 		return ErrInvalidMessage{Reason: "recovery frame sequence gap"}
 	}
-
-	streamCtx := c.getStreamCtx(streamID)
-	if err := streamCtx.stream.core.incomingQ(payload); err != nil {
+	if err := c.acceptFrame(streamID, flags, payload); err != nil {
 		return err
 	}
 	c.recovery.noteReceived(c, seq)
