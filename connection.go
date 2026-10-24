@@ -124,8 +124,15 @@ func (p *pendingConnection) startServer(codecs []CodecID, maxFrame uint32, recov
 }
 
 func (c *Connection) start() {
-	go c.writerLoop()
-	go c.readerLoop()
+	if c.isRecoveryEnabled() {
+		go c.recoveryWriterLoop()
+		go c.recoveryReaderLoop()
+		return
+	}
+	// closeTransport clears c.conn and c.writer while the loops run, so the
+	// loops must not read those fields.
+	go c.writerLoop(c.writer)
+	go c.readerLoop(c.conn)
 }
 
 func (c *Connection) nextOutboundSeq() uint64 {
@@ -409,18 +416,14 @@ func (c *Connection) dispatchMessage(stream *Stream, raw rawMessage) error {
 	return nil
 }
 
-func (c *Connection) writerLoop() {
-	if c.isRecoveryEnabled() {
-		c.recoveryWriterLoop()
-		return
-	}
+func (c *Connection) writerLoop(w *bufio.Writer) {
 	for {
 		// Block until at least one frame is available.
 		select {
 		case <-c.closeCh:
 			return
 		case frame := <-c.outbound:
-			if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
+			if err := c.writeFrameNoFlush(w, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
 				c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 				c.markClosed()
 				return
@@ -431,7 +434,7 @@ func (c *Connection) writerLoop() {
 		for drain {
 			select {
 			case frame := <-c.outbound:
-				if err := c.writeFrameNoFlush(c.writer, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
+				if err := c.writeFrameNoFlush(w, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
 					c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 					c.markClosed()
 					return
@@ -441,7 +444,7 @@ func (c *Connection) writerLoop() {
 			}
 		}
 		// Flush once for the entire batch.
-		if err := c.writer.Flush(); err != nil {
+		if err := w.Flush(); err != nil {
 			c.debug.noteFailure(DebugFailureWriterLoop, "writer flush failed: "+err.Error())
 			c.markClosed()
 			return
@@ -449,13 +452,9 @@ func (c *Connection) writerLoop() {
 	}
 }
 
-func (c *Connection) readerLoop() {
-	if c.isRecoveryEnabled() {
-		c.recoveryReaderLoop()
-		return
-	}
+func (c *Connection) readerLoop(conn net.Conn) {
 	for {
-		streamID, _, flags, payload, err := c.readFrame()
+		streamID, _, flags, payload, err := c.readFrameFrom(conn)
 		if err != nil {
 			c.debug.noteFailure(DebugFailureReaderLoop, "reader loop failed: "+err.Error())
 			c.markClosed()
@@ -514,7 +513,14 @@ func (c *Connection) enqueueFrame(frame outboundFrame) error {
 		case c.outbound <- frame:
 		}
 		c.signalSend()
-		return <-frame.queued
+		// The writer only takes frames while a transport is attached and exits
+		// on close without draining outbound.
+		select {
+		case err := <-frame.queued:
+			return err
+		case <-c.closeCh:
+			return ErrClosed{}
+		}
 	}
 	select {
 	case <-c.closeCh:

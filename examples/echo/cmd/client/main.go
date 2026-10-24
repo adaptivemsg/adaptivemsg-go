@@ -21,6 +21,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer conn.Close()
 
 	switch *cmd {
 	case "timeout":
@@ -44,6 +45,7 @@ func main() {
 
 func timeoutDemo(conn *am.Connection) error {
 	stream := conn.NewStream()
+	defer stream.Close()
 	log.Printf("No timeout by default")
 	if _, err := stream.SendRecv[*am.OkReply](&echo.MessageTimeout{Secs: 10}); err != nil {
 		return err
@@ -81,6 +83,7 @@ func timeoutDemo(conn *am.Connection) error {
 
 func whoelseSubscribeDemo(conn *am.Connection) error {
 	stream := conn.NewStream()
+	defer stream.Close()
 	if _, err := stream.SendRecv[*am.OkReply](&echo.SubWhoElseEvent{}); err != nil {
 		return err
 	}
@@ -144,6 +147,7 @@ func concurrentDemo(addr string) error {
 				reportErr(err)
 				return
 			}
+			defer conn.Close()
 
 			var streamWG sync.WaitGroup
 			for j := 0; j < 10; j++ {
@@ -151,6 +155,7 @@ func concurrentDemo(addr string) error {
 				go func(idx int) {
 					defer streamWG.Done()
 					stream := conn.NewStream()
+					defer stream.Close()
 					{
 						msg := "ni hao"
 						num := int32(100 * idx)

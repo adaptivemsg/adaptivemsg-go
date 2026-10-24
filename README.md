@@ -60,8 +60,15 @@ func main() {
 
 	// client
 	client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
-	conn, _ := client.Connect("tcp://127.0.0.1:5555")
-	reply, _ := conn.SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
+	conn, err := client.Connect("tcp://127.0.0.1:5555")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+	reply, err := conn.SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
+	if err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("reply: %s (trace %s)", reply.Answer, reply.Internal.TraceID)
 }
 ```
@@ -97,8 +104,13 @@ var _ = am.MustRegister[echo.MessageReply]()
 var _ = am.MustRegister[echo.WhoElseEvent]()
 
 func main() {
-	conn, _ := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true}).Connect("tcp://127.0.0.1:5560")
+	conn, err := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true}).Connect("tcp://127.0.0.1:5560")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
 	stream := conn.NewStream()
+	defer stream.Close()
 
 	for {
 		msg, err := stream.Recv[am.Message]()
@@ -237,6 +249,7 @@ if err != nil {
 	log.Printf("connect failed: %v", err)
 	return
 }
+defer conn.Close()
 
 reply, err := conn.SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
 if err != nil {
@@ -259,6 +272,7 @@ For a single stream:
 
 ```go
 stream := conn.NewStream()
+defer stream.Close()
 _, err := stream.Recv[*HelloReply]()
 if err != nil {
 	sdbg := stream.DebugState()

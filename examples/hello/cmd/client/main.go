@@ -19,9 +19,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	streamA := conn.NewStream()
-	streamB := conn.NewStream()
+	defer conn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -41,7 +39,9 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		reply, err := streamA.SendRecv[*hello.HelloReply](&hello.HelloRequest{
+		stream := conn.NewStream()
+		defer stream.Close()
+		reply, err := stream.SendRecv[*hello.HelloReply](&hello.HelloRequest{
 			Who:      "Alice",
 			Question: "how are you",
 		})
@@ -54,7 +54,9 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		_, err := streamB.SendRecv[*hello.HelloReply](&hello.HelloRequest{
+		stream := conn.NewStream()
+		defer stream.Close()
+		_, err := stream.SendRecv[*hello.HelloReply](&hello.HelloRequest{
 			Who:      "Bob",
 			Question: "error please",
 		})

@@ -166,6 +166,47 @@ func TestProtocolErrorOnOpenedStreamSendsFIN(t *testing.T) {
 	}
 }
 
+func TestRecoveryEnqueueReturnsWhenClosedWhileQueued(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		op      func(*Connection, *Stream) error
+		wantErr bool
+	}{
+		{name: "Send", op: func(conn *Connection, _ *Stream) error { return conn.Send(&OkReply{}) }, wantErr: true},
+		{name: "StreamClose", op: func(_ *Connection, stream *Stream) error { stream.Close(); return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := newDebugTestConnection(t)
+			conn.config.version = protocolVersionV3
+			conn.recovery = newClientRecoveryState(
+				defaultClientRecoveryOptions(),
+				defaultServerRecoveryOptions().negotiated(),
+				"tcp://127.0.0.1:1",
+				100*time.Millisecond,
+				recoveryToken{1},
+				recoveryToken{2},
+			)
+			stream := conn.NewStream()
+
+			// No writer loop runs, so the frame stays queued the way it does
+			// while the transport is detached.
+			done := make(chan error, 1)
+			go func() { done <- tc.op(conn, stream) }()
+			waitForCondition(t, time.Second, func() bool { return len(conn.outbound) == 1 })
+
+			conn.Close()
+			select {
+			case err := <-done:
+				if tc.wantErr && !errors.As(err, &ErrClosed{}) {
+					t.Fatalf("%s got %v, want ErrClosed", tc.name, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("%s still blocked after Close", tc.name)
+			}
+		})
+	}
+}
+
 func TestInboundFrameForLocallyClosedStreamIsDropped(t *testing.T) {
 	conn := newDebugTestConnection(t)
 	defer conn.Close()
