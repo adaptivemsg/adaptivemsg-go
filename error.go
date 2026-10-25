@@ -102,8 +102,8 @@ func (e ErrCompactFieldCount) Error() string {
 	return fmt.Sprintf("compact field count mismatch: expected %d, got %d", e.Expected, e.Got)
 }
 
-// ErrConnectTimeout indicates that the TCP connect or handshake exceeded
-// the timeout duration configured via Client.WithTimeout().
+// ErrConnectTimeout indicates that establishing a connection did not finish
+// within the limit set by [Client.WithConnectTimeout].
 type ErrConnectTimeout struct{}
 
 func (e ErrConnectTimeout) Error() string {
@@ -140,7 +140,7 @@ func (e ErrResumeRejected) Error() string {
 }
 
 // ErrRecvTimeout indicates that no message was received within the stream's
-// recv timeout, as configured via SetRecvTimeout.
+// recv timeout, as set by [Client.WithRecvTimeout] or SetRecvTimeout.
 type ErrRecvTimeout struct{}
 
 func (e ErrRecvTimeout) Error() string {
@@ -210,14 +210,6 @@ type ErrInvalidMessage struct {
 
 func (e ErrInvalidMessage) Error() string {
 	return e.Reason
-}
-
-// ErrHandshakeRejected indicates that the server explicitly rejected the
-// handshake. This is distinct from a version or codec mismatch.
-type ErrHandshakeRejected struct{}
-
-func (e ErrHandshakeRejected) Error() string {
-	return "handshake rejected"
 }
 
 // ErrNoCommonVersion indicates that no protocol version overlap exists between

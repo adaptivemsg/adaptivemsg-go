@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
+	"time"
 )
 
 func writeHandshakeRequest(conn net.Conn, version byte, codecs []byte, maxFrame uint32) error {
@@ -159,9 +161,9 @@ func TestHandshakeClientRejected(t *testing.T) {
 	}()
 
 	_, err := handshakeClient(clientConn, []CodecID{CodecMsgpackMap}, 0, protocolVersionV2)
-	var rejected ErrHandshakeRejected
-	if !errors.As(err, &rejected) {
-		t.Fatalf("expected ErrHandshakeRejected, got %v", err)
+	var noCommon ErrNoCommonCodec
+	if !errors.As(err, &noCommon) {
+		t.Fatalf("expected ErrNoCommonCodec, got %v", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("server write: %v", err)
@@ -318,5 +320,57 @@ func TestHandshakeV3RejectedByLegacyServer(t *testing.T) {
 	}
 	if err := <-errCh; err == nil {
 		t.Fatalf("expected server-side unsupported version error")
+	}
+}
+
+func TestServerClosesConnectionOnFrameAboveMaxFrame(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "tcp://"))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	config, err := handshakeClient(conn, []CodecID{CodecMsgpackCompact}, defaultMaxFrame, protocolVersionV2)
+	if err != nil {
+		t.Fatalf("handshakeClient: %v", err)
+	}
+	if config.maxFrame != defaultMaxFrame {
+		t.Fatalf("negotiated max frame %d, want %d", config.maxFrame, defaultMaxFrame)
+	}
+
+	// Send only the header: the server must reject it without waiting for, or
+	// allocating, the payload.
+	header := make([]byte, frameHeaderLen)
+	header[0] = protocolVersionV2
+	binary.BigEndian.PutUint32(header[6:10], defaultMaxFrame+1)
+	if _, err := conn.Write(header); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("Read got %v, want EOF from the server closing the connection", err)
+	}
+}
+
+func TestServerWithMaxFrameLimitsConnection(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer().WithMaxFrame(1024))
+	defer stop()
+	conn, err := NewClient().WithRecvTimeout(2 * time.Second).Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	big := &connTestEchoRequest{Text: strings.Repeat("x", 2048)}
+	if err := conn.Send(big); !errors.As(err, &ErrFrameTooLarge{}) {
+		t.Fatalf("Send got %v, want ErrFrameTooLarge", err)
+	}
+	reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "small"})
+	if err != nil {
+		t.Fatalf("SendRecv after the rejected Send: %v", err)
+	}
+	if reply.Text != "small" {
+		t.Fatalf("reply got %q, want %q", reply.Text, "small")
 	}
 }

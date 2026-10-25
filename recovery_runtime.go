@@ -515,6 +515,10 @@ func (c *Connection) recoveryWriterLoop() {
 				// Batch: also write a pending live frame before flushing
 				select {
 				case frame := <-c.outbound:
+					if frame.closing != nil {
+						c.finishRecoveryWriter(bw, frame.closing)
+						return
+					}
 					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
 						if err := c.writeFrameNoFlush(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
@@ -556,6 +560,10 @@ func (c *Connection) recoveryWriterLoop() {
 			default:
 				frame = outboundFrame{}
 			}
+			if frame.closing != nil {
+				c.finishRecoveryWriter(bw, frame.closing)
+				return
+			}
 			if frame.payload != nil {
 				stored, ok := stageLive(frame)
 				if !ok {
@@ -584,6 +592,10 @@ func (c *Connection) recoveryWriterLoop() {
 					return
 				case <-c.sendNotify:
 				case frame := <-c.outbound:
+					if frame.closing != nil {
+						c.finishRecoveryWriter(bw, frame.closing)
+						return
+					}
 					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
 						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
@@ -615,6 +627,10 @@ func (c *Connection) recoveryWriterLoop() {
 				stopAndDrain()
 			case frame := <-c.outbound:
 				stopAndDrain()
+				if frame.closing != nil {
+					c.finishRecoveryWriter(bw, frame.closing)
+					return
+				}
 				if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
 					if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
 						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
@@ -664,15 +680,25 @@ func (c *Connection) recoveryReaderLoop() {
 					c.markClosed()
 					return
 				}
+				if c.closing.Load() {
+					// Close sent CLOSE and waits for the peer to close its side.
+					c.markClosed()
+					return
+				}
 				c.debug.noteFailure(DebugFailureRecoveryRead, "recovery read failed: "+err.Error())
 				c.handleRecoveryTransportError(conn)
 				break
 			}
 			c.recovery.armReadDeadline(conn)
 			if streamID == controlStreamID {
-				if err := c.handleControlFrame(payload); err != nil {
+				peerClosed, err := c.handleControlFrame(payload)
+				if err != nil {
 					c.debug.noteFailure(DebugFailureRecoveryControl, "recovery control frame failed: "+err.Error())
 					c.markClosed()
+					return
+				}
+				if peerClosed {
+					c.closeByPeer()
 					return
 				}
 				continue
@@ -689,22 +715,34 @@ func (c *Connection) recoveryReaderLoop() {
 	}
 }
 
-func (c *Connection) handleControlFrame(payload []byte) error {
+// handleControlFrame applies a control frame and reports whether it was CLOSE.
+func (c *Connection) handleControlFrame(payload []byte) (bool, error) {
 	controlType, value, err := parseControlPayload(payload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	switch controlType {
 	case controlTypeAck:
 		c.recovery.ackReceived(value)
-		return nil
+		return false, nil
 	case controlTypePing:
 		// Liveness is already enforced by SetReadDeadline and periodic ping.
 		// Keep ping handling as a no-op for protocol compatibility.
-		return nil
+		return false, nil
+	case controlTypeClose:
+		return true, nil
 	default:
-		return ErrInvalidMessage{Reason: "unknown control frame type"}
+		return false, ErrInvalidMessage{Reason: "unknown control frame type"}
 	}
+}
+
+// finishRecoveryWriter writes CLOSE after the frames already written, so the
+// peer releases the connection instead of keeping it for a reconnect.
+func (c *Connection) finishRecoveryWriter(bw *bufio.Writer, done chan struct{}) {
+	if err := c.writeFrameTo(bw, controlStreamID, 0, 0, buildCloseControlPayload()); err != nil {
+		c.debug.noteFailure(DebugFailureRecoveryControl, "recovery close write failed: "+err.Error())
+	}
+	close(done)
 }
 
 func (c *Connection) handleRecoveryDataFrame(streamID uint32, seq uint64, flags FrameFlags, payload []byte) error {

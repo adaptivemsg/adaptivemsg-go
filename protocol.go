@@ -16,7 +16,9 @@ const (
 
 var handshakeMagic = [2]byte{'A', 'M'}
 
-const defaultMaxFrame = ^uint32(0)
+// defaultMaxFrame also bounds how much memory one frame header can make the
+// receiver allocate.
+const defaultMaxFrame = 16 << 20
 
 func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version byte) (connConfig, error) {
 	if err := validateCodecList(codecs); err != nil {
@@ -61,7 +63,7 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version b
 		return connConfig{}, ErrUnsupportedFrameVersion{Version: replyVersion}
 	}
 	if accept == 0 {
-		return connConfig{}, ErrHandshakeRejected{}
+		return connConfig{}, ErrNoCommonCodec{}
 	}
 	if !containsCodec(codecs, selected) {
 		return connConfig{}, ErrNoCommonCodec{}

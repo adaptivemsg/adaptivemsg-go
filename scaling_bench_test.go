@@ -19,7 +19,7 @@ func benchmarkScaling(b *testing.B, conns, streamsPerConn int, recoveryEnabled b
 	b.Helper()
 
 	server := NewServer()
-	client := NewClient().WithTimeout(5 * time.Second)
+	client := NewClient().WithConnectTimeout(5 * time.Second)
 	if recoveryEnabled {
 		server = server.WithRecovery(ServerRecoveryOptions{
 			Enable:            true,
@@ -237,7 +237,7 @@ func runScalingTest(t *testing.T, conns, streamsPerConn, iterations int, recover
 	t.Helper()
 
 	server := NewServer()
-	client := NewClient().WithTimeout(5 * time.Second)
+	client := NewClient().WithConnectTimeout(5 * time.Second)
 	if recoveryEnabled {
 		server = server.WithRecovery(ServerRecoveryOptions{
 			Enable:            true,

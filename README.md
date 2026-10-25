@@ -21,6 +21,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	am "adaptivemsg"
 )
@@ -58,8 +59,10 @@ func main() {
 		}
 	}()
 
-	// client
-	client := am.NewClient().WithRecovery(am.ClientRecoveryOptions{Enable: true})
+	// client: the server starts in the background, so wait up to 5s for it
+	client := am.NewClient().
+		WithConnectTimeout(5 * time.Second).
+		WithRecovery(am.ClientRecoveryOptions{Enable: true})
 	conn, err := client.Connect("tcp://127.0.0.1:5555")
 	if err != nil {
 		log.Fatal(err)
@@ -75,17 +78,22 @@ func main() {
 
 ## One-shot request-reply
 
-Use `Client.SendRecv` when the connection should be opened for one exchange
-and closed automatically:
+Use `Client.ConnectOnce` when the connection should be opened for one
+exchange and closed automatically:
 
 ```go
 reply, err := am.NewClient().
-	WithTimeout(5 * time.Second).
-	SendRecv[*HelloReply](
-		"tcp://127.0.0.1:5555",
-		&HelloRequest{Who: "alice"},
-	)
+	WithRecvTimeout(5 * time.Second).
+	ConnectOnce("tcp://127.0.0.1:5555").
+	SendRecv[*HelloReply](&HelloRequest{Who: "alice"})
 ```
+
+`ConnectOnce` does not dial; `SendRecv` connects, exchanges one request and
+reply, and closes the connection. A `OnceConn` can be used only once: a second
+`SendRecv` returns `ErrClosed`. `WithRecvTimeout` limits waiting for the
+reply; without it `SendRecv` waits indefinitely. Set `WithConnectTimeout` to
+wait for a server that is still starting. One-shot connections never use
+recovery.
 
 ## Dynamic receive
 
@@ -136,11 +144,12 @@ Functions:
 
 Client:
 - `NewClient`
-- `Client.WithTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithRecovery`, `Client.Connect`, `Client.SendRecv[T]`
+- `Client.WithConnectTimeout`, `Client.WithRecvTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithRecovery`, `Client.Connect`, `Client.ConnectOnce`
+- `OnceConn.SendRecv[T]`
 
 Server:
 - `NewServer`
-- `Server.WithRecovery`, `Server.Serve`, `Server.OnConnect`, `Server.OnDisconnect`, `Server.OnNewStream`, `Server.OnCloseStream`
+- `Server.WithCodecs`, `Server.WithMaxFrame`, `Server.WithRecovery`, `Server.Serve`, `Server.OnConnect`, `Server.OnDisconnect`, `Server.OnNewStream`, `Server.OnCloseStream`
 - `Netconn.PeerAddr`
 
 Connection (default stream view):
@@ -186,11 +195,15 @@ Notes:
 - Custom codecs implement `CodecImpl` and register with `RegisterCodec`; msgpack struct tags only apply to the msgpack built-ins. `CodecImpl.Encode` transfers ownership of the returned payload to the caller, so codecs must not mutate or reuse that backing storage after return.
 - Compact codec uses positional arrays; nested structs are encoded as arrays when eligible, but types with custom msgpack/binary/text encoders or unexported fields fall back to msgpack's normal encoding (typically maps), so struct tags may still apply there.
 - Connections act as the default stream; use `conn.SendRecv[Reply](msg)` for request-reply and `stream.Recv[Message]()` for dynamic receive.
+- A stream carries one conversation at a time: `Recv`, `PeekWire` and `SendRecv` must not run concurrently on the same stream, and the extra call returns `ErrConcurrentRecv` (a rejected `SendRecv` sends nothing). Open one stream per concurrent request-reply. After `SendRecv` returns `ErrRecvTimeout`, the stream discards the late reply, so the next request receives its own reply.
+- `Connection.Close()` delivers the messages already queued by `Send`: it writes them, tells the peer, and waits for the peer to close its side, at most 5 seconds. With recovery, the server then releases the connection at once instead of keeping it for `DetachedTTL`.
+- Frames are limited to 16 MiB by default; the limit is the smaller of `Client.WithMaxFrame` and `Server.WithMaxFrame`. `Send` returns `ErrFrameTooLarge` for a larger message and the connection stays usable.
+- `Client.WithConnectTimeout` sets how long establishing a connection may take: failed dials are retried until then, and with recovery it also limits each reconnect attempt. Without it the client dials once. `Client.WithRecvTimeout` sets the initial recv timeout of every stream; `SetRecvTimeout` changes it for one stream.
 - Register handler/message types with `MustRegister` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
 - Message names default to `am.<package-leaf>.<TypeName>`; implement `WireName() string` on a type if you need an override.
 - Example servers rely on build-tagged handlers; run them with `-tags server` (for example: `go run -tags server ./examples/hello/cmd/server`).
-- `Stream.Close()` on a stream opened with `NewStream` sends a `FIN` data frame and then releases the local stream. The peer releases its stream after processing that frame. Only the opener sends `FIN`: on a stream opened by the peer, and on stream 0, `Close()` only releases the local stream.
+- `Stream.Close()` on a stream opened with `NewStream` sends a `FIN` data frame and then releases the local stream. The peer delivers the messages sent before the `FIN`, then releases its stream. Only the opener sends `FIN`: on a stream opened by the peer, and on stream 0, `Close()` only releases the local stream.
 - Stream IDs are never reused within a connection. After 0xFFFFFFFE streams, `NewStream` returns streams whose operations report `ErrClosed`; open a new connection for further streams.
 
 ## Recovery
@@ -204,6 +217,7 @@ Notes:
 - `Recv()` can continue waiting across reconnect, and queued/unacknowledged outbound frames are replayed after resume.
 - `WaitClosed()` and `ErrClosed` refer to permanent logical closure, not a transient reconnectable transport loss.
 - Server `OnConnect` runs for the initial logical connection, not for every resumed transport; `OnDisconnect` runs on permanent logical close.
+- `Close()` sends a `CLOSE` control frame after the queued messages, so the peer closes the logical connection at once. A transport lost without `CLOSE` is kept for `DetachedTTL` so the client can reconnect.
 - Recovery does not cover client/server process restart, node reboot, or durable replay after process death.
 - `ClientRecoveryOptions` controls:
   - `Enable`: turn recovery on.
@@ -211,7 +225,7 @@ Notes:
   - `MaxReplayBytes`: client-side byte cap for retained unacknowledged outbound frames.
 - `ServerRecoveryOptions` controls:
   - `Enable`: turn recovery on.
-  - `DetachedTTL`: how long the server keeps a detached logical connection alive.
+  - `DetachedTTL`: how long the server keeps a logical connection whose transport was lost without `CLOSE`.
   - `MaxReplayBytes`: server-side byte cap for retained unacknowledged outbound frames.
   - `AckEvery` / `AckDelay`: server-selected cumulative ACK batching policy.
   - `HeartbeatInterval` / `HeartbeatTimeout`: server-selected idle failure detection policy for quiet connections.
@@ -302,7 +316,7 @@ Common codes include:
 
 | Failure code | Likely cause | First checks |
 |---|---|---|
-| `stream.recv_timeout` | No message arrived before stream recv timeout | Check `SetRecvTimeout` value; verify peer is producing responses/events; inspect `InboxDepth` and `IncomingDepth` |
+| `stream.recv_timeout` | No message arrived before stream recv timeout | Check the `WithRecvTimeout` / `SetRecvTimeout` value; verify peer is producing responses/events; inspect `InboxDepth` and `IncomingDepth` |
 | `stream.encode` | Local message cannot be encoded by negotiated codec | Validate message shape/tags; confirm codec supports payload type |
 | `stream.enqueue` | Connection is closing/closed or replay enqueue rejected | Check `ConnectionDebugState.Closed`; inspect replay limits and recent close reason |
 | `stream.decode` | Received payload cannot be decoded into expected type | Compare wire type versus expected type; verify registry/type registration order |

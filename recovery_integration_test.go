@@ -310,7 +310,7 @@ func TestRecoverySendRecvAfterReconnect(t *testing.T) {
 	addr, stop := startRecoveryTestServer(t, server)
 	defer stop()
 
-	client := NewClient().WithTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
+	client := NewClient().WithConnectTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
 	conn, err := client.Connect("tcp://" + addr)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -350,7 +350,7 @@ func TestRecoveryReplaysReplyAfterTransportBreak(t *testing.T) {
 	addr, stop := startRecoveryTestServer(t, server)
 	defer stop()
 
-	client := NewClient().WithTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
+	client := NewClient().WithConnectTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
 	conn, err := client.Connect("tcp://" + addr)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -382,7 +382,7 @@ func TestRecoveryQueuesSendWhileDetached(t *testing.T) {
 	addr, stop := startRecoveryTestServer(t, server)
 	defer stop()
 
-	client := NewClient().WithTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
+	client := NewClient().WithConnectTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
 	conn, err := client.Connect("tcp://" + addr)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -412,7 +412,7 @@ func TestRecoveryHeartbeatKeepsIdleConnectionAlive(t *testing.T) {
 	addr, stop := startRecoveryTestServer(t, server)
 	defer stop()
 
-	client := NewClient().WithTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
+	client := NewClient().WithConnectTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
 	conn, err := client.Connect("tcp://" + addr)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -446,7 +446,7 @@ func TestRecoveryHeartbeatDetectsIdleBlackholeAndReconnects(t *testing.T) {
 	addr, resumed, stop := startRecoveryHeartbeatBlackholeServer(t, serverOpts)
 	defer stop()
 
-	client := NewClient().WithTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
+	client := NewClient().WithConnectTimeout(500 * time.Millisecond).WithRecovery(clientOpts)
 	conn, err := client.Connect("tcp://" + addr)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)

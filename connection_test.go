@@ -5,8 +5,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -39,6 +44,337 @@ func (*connTestErrRequest) WireName() string {
 
 func (*connTestErrRequest) Handle(*StreamContext) (Message, error) {
 	return nil, errors.New("boom")
+}
+
+var _ = MustRegister[connTestSlowRequest]()
+
+type connTestSlowRequest struct{}
+
+func (*connTestSlowRequest) WireName() string {
+	return "am.test.SlowRequest"
+}
+
+func (*connTestSlowRequest) Handle(*StreamContext) (Message, error) {
+	time.Sleep(300 * time.Millisecond)
+	return &OkReply{}, nil
+}
+
+var _ = MustRegister[connTestRecordRequest]()
+
+var connTestRecorded atomic.Int64
+
+type connTestRecordRequest struct{}
+
+func (*connTestRecordRequest) WireName() string {
+	return "am.test.RecordRequest"
+}
+
+func (*connTestRecordRequest) Handle(*StreamContext) (Message, error) {
+	connTestRecorded.Add(1)
+	return nil, nil
+}
+
+var _ = MustRegister[connTestPushThenCloseRequest]()
+
+// connTestPushThenCloseRequest makes the server send Count replies and then
+// close the connection.
+type connTestPushThenCloseRequest struct {
+	Count int `am:"count"`
+}
+
+func (*connTestPushThenCloseRequest) WireName() string {
+	return "am.test.PushThenCloseRequest"
+}
+
+func (r *connTestPushThenCloseRequest) Handle(ctx *StreamContext) (Message, error) {
+	for i := range r.Count {
+		if err := ctx.stream.Send(&connTestEchoReply{Text: strconv.Itoa(i)}); err != nil {
+			return nil, err
+		}
+	}
+	ctx.stream.connection.Close()
+	return nil, nil
+}
+
+func TestStreamCloseAfterSendDeliversLastMessage(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := NewClient().Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	const streams = 200
+	connTestRecorded.Store(0)
+	for i := 0; i < streams; i++ {
+		stream := conn.NewStream()
+		if err := stream.Send(&connTestRecordRequest{}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		stream.Close()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for connTestRecorded.Load() < streams && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := connTestRecorded.Load(); got != streams {
+		t.Fatalf("handled %d of %d messages sent before Close", got, streams)
+	}
+}
+
+func TestConnectionCloseWhileDeliveringIsRaceFree(t *testing.T) {
+	// OkReply has no handler, so the server queues it for a reader that never
+	// comes; connTestSlowRequest is still being handled when the client
+	// closes.
+	for _, msg := range []Message{&OkReply{}, &connTestSlowRequest{}} {
+		disconnected := make(chan struct{})
+		server := NewServer().OnDisconnect(func(Netconn) error {
+			close(disconnected)
+			return nil
+		})
+		addr, stop := startClientTestServer(t, server)
+		conn, err := NewClient().Connect(addr)
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		if err := conn.Send(msg); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		conn.Close()
+		select {
+		case <-disconnected:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("server did not see the close after %T", msg)
+		}
+		stop()
+	}
+}
+
+func TestSendRecvWhileReceivingSendsNothing(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := NewClient().Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+	stream := conn.NewStream()
+	defer stream.Close()
+	stream.SetRecvTimeout(300 * time.Millisecond)
+
+	recvDone := make(chan error, 1)
+	go func() {
+		_, err := stream.Recv[Message]()
+		recvDone <- err
+	}()
+	for !stream.recvActive.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := stream.SendRecv[*OkReply](&connTestRecordRequest{}); !errors.As(err, &ErrConcurrentRecv{}) {
+		t.Fatalf("SendRecv got %v, want ErrConcurrentRecv", err)
+	}
+	// Had the request been sent, its OkReply would have reached the Recv.
+	if err := <-recvDone; !errors.As(err, &ErrRecvTimeout{}) {
+		t.Fatalf("Recv got %v, want ErrRecvTimeout", err)
+	}
+}
+
+func TestSendRecvDiscardsLateReplyAfterTimeout(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := NewClient().Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+	stream := conn.NewStream()
+	defer stream.Close()
+
+	stream.SetRecvTimeout(100 * time.Millisecond)
+	if _, err := stream.SendRecv[*OkReply](&connTestSlowRequest{}); !errors.As(err, &ErrRecvTimeout{}) {
+		t.Fatalf("slow SendRecv got %v, want ErrRecvTimeout", err)
+	}
+	stream.SetRecvTimeout(2 * time.Second)
+	reply, err := stream.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "second"})
+	if err != nil {
+		t.Fatalf("second SendRecv: %v", err)
+	}
+	if reply.Text != "second" {
+		t.Fatalf("second SendRecv got %q, want %q", reply.Text, "second")
+	}
+}
+
+func TestConcurrentSendRecvOnOneStreamNeverMismatches(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := NewClient().WithRecvTimeout(2 * time.Second).Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 50 {
+				text := fmt.Sprintf("%d-%d", g, i)
+				reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: text})
+				if errors.As(err, &ErrConcurrentRecv{}) {
+					continue
+				}
+				if err != nil {
+					t.Errorf("SendRecv: %v", err)
+					return
+				}
+				if reply.Text != text {
+					t.Errorf("request %q got the reply %q", text, reply.Text)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestCloseDeliversQueuedMessages(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recovery=%v", recovery), func(t *testing.T) {
+			server := NewServer()
+			client := NewClient()
+			if recovery {
+				server.WithRecovery(ServerRecoveryOptions{Enable: true})
+				client.WithRecovery(ClientRecoveryOptions{Enable: true})
+			}
+			addr, stop := startClientTestServer(t, server)
+			defer stop()
+
+			const rounds, perRound = 20, 10
+			before := connTestRecorded.Load()
+			for range rounds {
+				conn, err := client.Connect(addr)
+				if err != nil {
+					t.Fatalf("Connect: %v", err)
+				}
+				for range perRound {
+					if err := conn.Send(&connTestRecordRequest{}); err != nil {
+						t.Fatalf("Send: %v", err)
+					}
+				}
+				conn.Close()
+			}
+			const want = rounds * perRound
+			deadline := time.Now().Add(5 * time.Second)
+			for connTestRecorded.Load()-before < want && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := connTestRecorded.Load() - before; got != want {
+				t.Fatalf("server handled %d of the %d messages sent before Close", got, want)
+			}
+		})
+	}
+}
+
+func TestSendAfterCloseFails(t *testing.T) {
+	addr, stop := startClientTestServer(t, NewServer())
+	defer stop()
+	conn, err := NewClient().Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	conn.Close()
+	if err := conn.Send(&connTestRecordRequest{}); !errors.As(err, &ErrClosed{}) {
+		t.Fatalf("Send after Close got %v, want ErrClosed", err)
+	}
+}
+
+func TestRecoveryCloseReleasesServerConnection(t *testing.T) {
+	disconnected := make(chan struct{}, 1)
+	server := NewServer().
+		WithRecovery(ServerRecoveryOptions{Enable: true, DetachedTTL: 10 * time.Second}).
+		OnDisconnect(func(Netconn) error {
+			disconnected <- struct{}{}
+			return nil
+		})
+	addr, stop := startClientTestServer(t, server)
+	defer stop()
+	conn, err := NewClient().WithRecovery(ClientRecoveryOptions{Enable: true}).Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if got := conn.DebugState().Protocol; got != protocolVersionV3 {
+		t.Fatalf("negotiated protocol %d, want %d", got, protocolVersionV3)
+	}
+
+	conn.Close()
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server kept the recovery connection after Close")
+	}
+}
+
+func TestRecvGetsMessagesSentBeforePeerClose(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recovery=%v", recovery), func(t *testing.T) {
+			server := NewServer()
+			client := NewClient().WithRecvTimeout(2 * time.Second)
+			if recovery {
+				server.WithRecovery(ServerRecoveryOptions{Enable: true})
+				client.WithRecovery(ClientRecoveryOptions{Enable: true})
+			}
+			addr, stop := startClientTestServer(t, server)
+			defer stop()
+			conn, err := client.Connect(addr)
+			if err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			defer conn.Close()
+
+			const count = 100
+			if err := conn.Send(&connTestPushThenCloseRequest{Count: count}); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			for i := range count {
+				reply, err := conn.Recv[*connTestEchoReply]()
+				if err != nil {
+					t.Fatalf("Recv %d: %v", i, err)
+				}
+				if reply.Text != strconv.Itoa(i) {
+					t.Fatalf("Recv %d got %q", i, reply.Text)
+				}
+			}
+			if _, err := conn.Recv[Message](); !errors.As(err, &ErrClosed{}) {
+				t.Fatalf("Recv after the pushed messages got %v, want ErrClosed", err)
+			}
+		})
+	}
+}
+
+func TestCloseReturnsWhenPeerStopsReading(t *testing.T) {
+	// The peer completes the handshake and then never reads.
+	addr := startClientTestPeer(t, func(conn net.Conn) {
+		_, _ = handshakeServer(conn, []CodecID{CodecMsgpackCompact, CodecMsgpackMap}, defaultMaxFrame, false)
+	})
+	conn, err := NewClient().Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	big := &connTestEchoRequest{Text: strings.Repeat("x", 1<<20)}
+	for range 32 {
+		if err := conn.Send(big); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+
+	start := time.Now()
+	conn.Close()
+	if elapsed := time.Since(start); elapsed > closeFlushTimeout+time.Second {
+		t.Fatalf("Close returned after %v", elapsed)
+	}
 }
 
 func TestStreamCloseReleasesPeer(t *testing.T) {
@@ -142,6 +478,40 @@ func TestPeerOpenedStreamCloseSendsNoFIN(t *testing.T) {
 	}
 	if got := conn.DebugState().StreamCount; got != 0 {
 		t.Fatalf("stream count got %d want 0", got)
+	}
+}
+
+func TestLocallyClosedPeerStreamIsNotReopened(t *testing.T) {
+	conn := newDebugTestConnection(t)
+	defer conn.Close()
+
+	if err := conn.acceptFrame(1, 0, nil); err != nil {
+		t.Fatalf("acceptFrame: %v", err)
+	}
+	conn.streamsMu.Lock()
+	stream := conn.streams[1].stream
+	conn.streamsMu.Unlock()
+	stream.Close()
+
+	if err := conn.acceptFrame(1, 0, nil); err != nil {
+		t.Fatalf("acceptFrame after close: %v", err)
+	}
+	if got := conn.DebugState().StreamCount; got != 0 {
+		t.Fatalf("stream count got %d, want 0: the closed stream was opened again", got)
+	}
+	if got := conn.debug.streamsOpened.Load(); got != 1 {
+		t.Fatalf("streams opened got %d, want 1", got)
+	}
+
+	// The peer's FIN ends the stream, so its ID is forgotten.
+	if err := conn.acceptFrame(1, FrameFlagFIN, nil); err != nil {
+		t.Fatalf("acceptFrame FIN: %v", err)
+	}
+	conn.streamsMu.Lock()
+	reserved := len(conn.closedPeerStreams)
+	conn.streamsMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("%d stream IDs still reserved after FIN, want 0", reserved)
 	}
 }
 

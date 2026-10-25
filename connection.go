@@ -2,6 +2,8 @@ package adaptivemsg
 
 import (
 	"bufio"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,10 @@ const (
 	// maxStreamID is the last ID NewStream hands out; the only larger value is
 	// controlStreamID.
 	maxStreamID = controlStreamID - 1
+	// closeFlushTimeout bounds how long Close waits for queued frames to be
+	// written, and how long a clean close by the peer waits for the frames
+	// received before it to be delivered.
+	closeFlushTimeout = 5 * time.Second
 )
 
 type connConfig struct {
@@ -23,12 +29,16 @@ type connConfig struct {
 	maxFrame uint32
 }
 
+// outboundFrame is a frame for the writer. A frame with closing set carries no
+// data: the writer stops after writing the frames queued before it and closes
+// closing.
 type outboundFrame struct {
 	streamID uint32
 	seq      uint64
 	flags    FrameFlags
 	payload  []byte
 	queued   chan error
+	closing  chan struct{}
 }
 
 type handlerJob struct {
@@ -45,19 +55,23 @@ type handlerJob struct {
 // all operate on stream 0. For multiplexed messaging, create additional streams
 // with [Connection.NewStream].
 //
-// All exported methods are safe for concurrent use. When the Connection is
-// closed (by either side), all outstanding streams are torn down and any
-// blocking Recv calls return [ErrClosed].
+// All exported methods are safe for concurrent use, except that the default
+// stream, like any [Stream], runs one Recv, PeekWire or SendRecv at a time;
+// use [Connection.NewStream] for concurrent request-reply. When the
+// Connection is closed (by either side), all outstanding streams are torn
+// down and any blocking Recv calls return [ErrClosed].
 type Connection struct {
 	conn              net.Conn
 	writer            *bufio.Writer
 	registry          *registry
 	handlersEnabled   bool
+	recvTimeout       time.Duration
 	config            connConfig
 	debug             connectionDebugCounters
 	outbound          chan outboundFrame
 	sendNotify        chan struct{}
 	streams           map[uint32]*StreamContext
+	closedPeerStreams map[uint32]struct{}
 	streamsMu         sync.Mutex
 	nextStreamID      atomic.Uint64
 	defaultStreamOnce sync.Once
@@ -71,6 +85,7 @@ type Connection struct {
 	transportGen      uint64
 	transportResume   uint64
 	recovery          *recoveryState
+	closing           atomic.Bool
 	closeOnce         sync.Once
 	closeCh           chan struct{}
 	closed            atomic.Bool
@@ -146,12 +161,94 @@ func (c *Connection) isRecoveryEnabled() bool {
 	return c != nil && c.recovery != nil && c.config.version == protocolVersionV3
 }
 
-// Close shuts down the connection and all of its streams. It closes the
-// underlying transport, drains internal channels, and signals any goroutines
-// blocked in [Connection.Recv] or [Connection.WaitClosed]. Close is
-// non-blocking and idempotent; calling it more than once is safe.
+// Close shuts down the connection and all of its streams. It first delivers
+// the messages already queued by Send: it writes them, tells the peer that
+// nothing more follows, and waits for the peer to close its side, at most 5
+// seconds in total. In v3 the peer then releases the connection at once
+// instead of keeping it for a reconnect. Close then closes the transport and
+// wakes goroutines blocked in [Connection.Recv] or [Connection.WaitClosed].
+// Send fails with [ErrClosed] once Close has begun. Close is idempotent;
+// calling it more than once is safe.
 func (c *Connection) Close() {
+	if c.closing.CompareAndSwap(false, true) {
+		c.closeGracefully()
+	}
 	c.markClosed()
+}
+
+// closeGracefully writes the frames queued so far, half-closes the transport
+// and waits for the peer to close its side, at most closeFlushTimeout in
+// total. Closing a socket that still holds unread data makes TCP reset the
+// connection, and the peer then loses the frames it has not read yet.
+func (c *Connection) closeGracefully() {
+	if c.currentTransport() == nil {
+		return
+	}
+	timer := time.NewTimer(closeFlushTimeout)
+	defer timer.Stop()
+	marker := outboundFrame{closing: make(chan struct{})}
+	select {
+	case c.outbound <- marker:
+	case <-c.closeCh:
+		return
+	case <-timer.C:
+		return
+	}
+	c.signalSend()
+	select {
+	case <-marker.closing:
+	case <-c.closeCh:
+		return
+	case <-timer.C:
+		return
+	}
+	conn, ok := c.currentTransport().(interface{ CloseWrite() error })
+	if !ok || conn.CloseWrite() != nil {
+		return
+	}
+	// The reader sees the peer's close and releases the connection.
+	select {
+	case <-c.closeCh:
+	case <-timer.C:
+	}
+}
+
+// closeByPeer handles a clean close by the peer. The frames received before
+// it are delivered to their streams, waiting at most closeFlushTimeout, before
+// the connection is released.
+func (c *Connection) closeByPeer() {
+	if !c.closing.CompareAndSwap(false, true) {
+		// Close is waiting for the peer to finish.
+		c.markClosed()
+		return
+	}
+	c.streamsMu.Lock()
+	streams := make([]*Stream, 0, len(c.streams))
+	for _, streamCtx := range c.streams {
+		streams = append(streams, streamCtx.stream)
+	}
+	c.streamsMu.Unlock()
+
+	timer := time.NewTimer(closeFlushTimeout)
+	defer timer.Stop()
+	defer c.markClosed()
+	// A nil payload is the FIN marker: each decode loop releases its stream
+	// after delivering the frames queued before it.
+	for _, stream := range streams {
+		select {
+		case stream.incoming <- nil:
+		case <-stream.done:
+		case <-timer.C:
+			return
+		}
+	}
+	for _, stream := range streams {
+		select {
+		case <-stream.done:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 // WaitClosed blocks until the connection has fully closed. It is commonly used
@@ -170,7 +267,7 @@ func (c *Connection) Send(msg Message) error {
 
 // SendRecv sends msg on the default stream and blocks until a reply of type T
 // arrives. It returns [ErrClosed] if the connection closes before a reply is
-// received.
+// received. See [Stream.SendRecv].
 func (c *Connection) SendRecv[T any](msg Message) (T, error) {
 	return c.defaultStream().SendRecv[T](msg)
 }
@@ -287,6 +384,21 @@ func (c *Connection) removeStream(streamID uint32) {
 	}
 }
 
+// closePeerStream releases a stream that the peer opened. The peer is not told,
+// so the ID stays reserved until the peer's FIN: later frames on it are dropped
+// instead of opening the stream again.
+func (c *Connection) closePeerStream(streamID uint32) {
+	c.streamsMu.Lock()
+	if _, ok := c.streams[streamID]; ok && streamID != defaultStreamID {
+		if c.closedPeerStreams == nil {
+			c.closedPeerStreams = make(map[uint32]struct{})
+		}
+		c.closedPeerStreams[streamID] = struct{}{}
+	}
+	c.streamsMu.Unlock()
+	c.removeStream(streamID)
+}
+
 // openedStream reports whether NewStream on this side allocated streamID.
 func (c *Connection) openedStream(streamID uint32) bool {
 	return streamID != defaultStreamID && uint64(streamID) <= c.nextStreamID.Load()
@@ -306,10 +418,12 @@ func (c *Connection) getStreamCtx(streamID uint32, inbound bool) *StreamContext 
 		return streamCtx
 	}
 	// Stream IDs are never reused, so a missing stream that this side opened
-	// was closed on this side.
-	if inbound && c.openedStream(streamID) {
-		c.streamsMu.Unlock()
-		return nil
+	// was closed on this side, as was one listed in closedPeerStreams.
+	if inbound {
+		if _, closed := c.closedPeerStreams[streamID]; closed || c.openedStream(streamID) {
+			c.streamsMu.Unlock()
+			return nil
+		}
 	}
 	streamCtx := c.newStreamCtx(streamID)
 	c.streams[streamID] = streamCtx
@@ -328,15 +442,16 @@ func (c *Connection) newStreamCtx(streamID uint32) *StreamContext {
 	if c.handlersEnabled {
 		handlerCh = make(chan handlerJob, streamQueueSize)
 	}
-	return &StreamContext{
-		stream: &Stream{
-			id:         streamID,
-			connection: c,
-			inbox:      make(chan rawMessage, streamQueueSize),
-			incoming:   make(chan []byte, streamQueueSize),
-			handlerCh:  handlerCh,
-		},
+	stream := &Stream{
+		id:         streamID,
+		connection: c,
+		inbox:      make(chan rawMessage, streamQueueSize),
+		incoming:   make(chan []byte, streamQueueSize),
+		handlerCh:  handlerCh,
+		done:       make(chan struct{}),
 	}
+	stream.setRecvTimeout(c.recvTimeout)
+	return &StreamContext{stream: stream}
 }
 
 func (c *Connection) startStream(streamCtx *StreamContext) {
@@ -370,10 +485,17 @@ func (c *Connection) handlerLoop(streamCtx *StreamContext) {
 
 func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 	stream := streamCtx.stream
+	defer func() {
+		close(stream.inbox)
+		if stream.handlerCh != nil {
+			close(stream.handlerCh)
+		}
+	}()
 	for {
 		select {
-		case payload, ok := <-stream.incoming:
-			if !ok {
+		case payload := <-stream.incoming:
+			if payload == nil {
+				c.removeStream(stream.id)
 				return
 			}
 			raw, err := newRawMessageFromPayload(c.config.codecID, payload)
@@ -387,6 +509,8 @@ func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 				stream.protocolError("codec_error", err.Error())
 				return
 			}
+		case <-stream.done:
+			return
 		case <-c.closeCh:
 			return
 		}
@@ -419,31 +543,33 @@ func (c *Connection) dispatchMessage(stream *Stream, raw rawMessage) error {
 func (c *Connection) writerLoop(w *bufio.Writer) {
 	for {
 		// Block until at least one frame is available.
+		var frame outboundFrame
 		select {
 		case <-c.closeCh:
 			return
-		case frame := <-c.outbound:
+		case frame = <-c.outbound:
+		}
+		// Write it and any other queued frames, then flush once for the batch.
+		for {
+			if frame.closing != nil {
+				if err := w.Flush(); err != nil {
+					c.debug.noteFailure(DebugFailureWriterLoop, "writer flush failed: "+err.Error())
+				}
+				close(frame.closing)
+				return
+			}
 			if err := c.writeFrameNoFlush(w, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
 				c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
 				c.markClosed()
 				return
 			}
-		}
-		// Drain any queued frames without blocking.
-		drain := true
-		for drain {
 			select {
-			case frame := <-c.outbound:
-				if err := c.writeFrameNoFlush(w, frame.streamID, frame.seq, frame.flags, frame.payload); err != nil {
-					c.debug.noteFailure(DebugFailureWriterLoop, "writer loop failed: "+err.Error())
-					c.markClosed()
-					return
-				}
+			case frame = <-c.outbound:
+				continue
 			default:
-				drain = false
 			}
+			break
 		}
-		// Flush once for the entire batch.
 		if err := w.Flush(); err != nil {
 			c.debug.noteFailure(DebugFailureWriterLoop, "writer flush failed: "+err.Error())
 			c.markClosed()
@@ -455,6 +581,11 @@ func (c *Connection) writerLoop(w *bufio.Writer) {
 func (c *Connection) readerLoop(conn net.Conn) {
 	for {
 		streamID, _, flags, payload, err := c.readFrameFrom(conn)
+		if errors.Is(err, io.EOF) {
+			// The peer closed the transport at a frame boundary.
+			c.closeByPeer()
+			return
+		}
 		if err != nil {
 			c.debug.noteFailure(DebugFailureReaderLoop, "reader loop failed: "+err.Error())
 			c.markClosed()
@@ -471,13 +602,24 @@ func (c *Connection) readerLoop(conn net.Conn) {
 func (c *Connection) acceptFrame(streamID uint32, flags FrameFlags, payload []byte) error {
 	fin := flags&FrameFlagFIN != 0 && streamID != defaultStreamID && streamID != controlStreamID
 	if fin && len(payload) == 0 {
-		c.removeStream(streamID)
+		c.streamsMu.Lock()
+		streamCtx := c.streams[streamID]
+		delete(c.closedPeerStreams, streamID)
+		c.streamsMu.Unlock()
+		if streamCtx != nil {
+			streamCtx.stream.queueFIN()
+		}
 		return nil
 	}
 	streamCtx := c.getStreamCtx(streamID, true)
 	if streamCtx == nil {
 		if c.closed.Load() {
 			return ErrClosed{}
+		}
+		if fin {
+			c.streamsMu.Lock()
+			delete(c.closedPeerStreams, streamID)
+			c.streamsMu.Unlock()
 		}
 		return nil
 	}
@@ -491,7 +633,7 @@ func (c *Connection) acceptFrame(streamID uint32, flags FrameFlags, payload []by
 		}
 	}
 	if fin {
-		c.removeStream(streamID)
+		streamCtx.stream.queueFIN()
 	}
 	return nil
 }
@@ -504,6 +646,9 @@ func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
 }
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {
+	if c.closing.Load() {
+		return ErrClosed{}
+	}
 	if c.isRecoveryEnabled() {
 		frame.seq = 0
 		frame.queued = make(chan error, 1)

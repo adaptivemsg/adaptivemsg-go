@@ -16,9 +16,11 @@ import (
 // type from the wire name. A concrete type (for example *EchoReply) is decoded
 // directly without a registry lookup.
 //
-// Send is safe for concurrent use by multiple goroutines. Recv and SendRecv
-// must not be called concurrently on the same Stream; doing so returns
-// [ErrConcurrentRecv].
+// A Stream carries one ordered conversation. Send is safe for concurrent use
+// by multiple goroutines, but Recv, PeekWire and SendRecv must not be called
+// concurrently on the same Stream: the extra call returns [ErrConcurrentRecv],
+// and a rejected SendRecv sends nothing. Use one Stream per concurrent
+// conversation.
 type Stream struct {
 	id               uint32
 	connection       *Connection
@@ -26,10 +28,12 @@ type Stream struct {
 	inbox            chan rawMessage
 	incoming         chan []byte
 	handlerCh        chan handlerJob
+	done             chan struct{}
 	recvTimeoutNanos atomic.Int64
 	recvActive       atomic.Bool
 	peeked           rawMessage
 	hasPeeked        bool
+	staleReplies     int
 	closed           atomic.Bool
 	closeOnce        sync.Once
 	sendMu           sync.Mutex
@@ -42,17 +46,18 @@ func (s *Stream) ID() uint32 {
 }
 
 // Close releases this stream. If this side opened the stream with
-// [Connection.NewStream], Close first queues a FIN frame so the peer can
-// release its copy. Only the opener sends FIN, so a stream opened by the peer
-// is released locally, as is stream 0, whose lifetime follows the connection.
-// After Close returns, subsequent Send and Recv calls on this stream return
-// [ErrClosed]. Close is idempotent.
+// [Connection.NewStream], Close first queues a FIN frame; the peer delivers
+// the messages sent before it and then releases its copy. Only the opener
+// sends FIN, so a stream opened by the peer is released locally, as is
+// stream 0, whose lifetime follows the connection; frames the peer still sends
+// on such a stream are dropped. After Close returns, subsequent Send and Recv
+// calls on this stream return [ErrClosed]. Close is idempotent.
 func (s *Stream) Close() {
 	if s == nil || s.connection == nil {
 		return
 	}
 	if !s.connection.openedStream(s.id) {
-		s.connection.removeStream(s.id)
+		s.connection.closePeerStream(s.id)
 		return
 	}
 	s.sendMu.Lock()
@@ -97,19 +102,33 @@ func (s *Stream) Send(msg Message) error {
 // SendRecv sends msg on this stream and blocks until a reply of type T is
 // received. If the peer handler returns an error, the reply is decoded as an
 // [ErrorReply] and returned as [ErrRemote]. If the incoming message cannot be
-// converted to T, [ErrTypeMismatch] is returned. The call also respects the
-// receive timeout set by [Stream.SetRecvTimeout].
+// converted to T, [ErrTypeMismatch] is returned.
+//
+// The call respects the receive timeout set by [Stream.SetRecvTimeout]. After
+// [ErrRecvTimeout] the stream discards the late reply when it arrives, so the
+// next request on this stream receives its own reply. It returns
+// [ErrConcurrentRecv] without sending msg if a Recv, PeekWire or SendRecv is
+// already in progress on this stream.
 func (s *Stream) SendRecv[T any](msg Message) (T, error) {
 	return sendRecvAs[T](s, msg)
 }
 
 func sendRecvAs[T any](stream *Stream, msg Message) (T, error) {
 	var zero T
+	release, err := stream.recvGuard()
+	if err != nil {
+		return zero, err
+	}
+	defer release()
 	if err := stream.sendBoxed(msg); err != nil {
 		return zero, err
 	}
-	raw, err := stream.recvRaw()
+	raw, err := stream.takeRaw()
 	if err != nil {
+		if _, ok := err.(ErrRecvTimeout); ok {
+			// The recv guard protects staleReplies, as it does peeked.
+			stream.staleReplies++
+		}
 		return zero, err
 	}
 	if raw.Wire == errorReplyWireName {
@@ -153,8 +172,8 @@ func decodeStreamRawAs[T any](stream *Stream, raw rawMessage) (T, error) {
 // [ErrClosed] if the connection is shut down, or [ErrTypeMismatch] if the
 // decoded message cannot be converted to T.
 //
-// Only one goroutine may call Recv (or SendRecv) at a time; a concurrent
-// call returns [ErrConcurrentRecv].
+// Only one of Recv, PeekWire and SendRecv may run on a stream at a time; a
+// concurrent call returns [ErrConcurrentRecv].
 func (s *Stream) Recv[T any]() (T, error) {
 	var zero T
 	raw, err := s.recvRaw()
@@ -195,6 +214,11 @@ func (s *Stream) recvRaw() (rawMessage, error) {
 		return rawMessage{}, err
 	}
 	defer release()
+	return s.takeRaw()
+}
+
+// takeRaw returns the next message. The caller holds the recv guard.
+func (s *Stream) takeRaw() (rawMessage, error) {
 	if s.hasPeeked {
 		msg := s.peeked
 		s.hasPeeked = false
@@ -231,34 +255,37 @@ func (s *Stream) peekRaw() (rawMessage, error) {
 }
 
 func (s *Stream) readRaw() (rawMessage, error) {
-	timeoutNanos := s.recvTimeoutNanos.Load()
-	if timeoutNanos == 0 {
-		select {
-		case msg, ok := <-s.inbox:
-			if !ok {
-				return rawMessage{}, ErrClosed{}
-			}
-			s.noteReceivedMessage()
-			return msg, nil
-		case <-s.connection.closeCh:
-			return rawMessage{}, ErrClosed{}
-		}
+	var timeout <-chan time.Time
+	if nanos := s.recvTimeoutNanos.Load(); nanos > 0 {
+		timer := time.NewTimer(time.Duration(nanos))
+		defer timer.Stop()
+		timeout = timer.C
 	}
-	timer := time.NewTimer(time.Duration(timeoutNanos))
-	defer timer.Stop()
-	select {
-	case msg, ok := <-s.inbox:
+	for {
+		var msg rawMessage
+		var ok bool
+		select {
+		case msg, ok = <-s.inbox:
+		case <-s.connection.closeCh:
+			// Messages received before the connection closed are still delivered.
+			select {
+			case msg, ok = <-s.inbox:
+			default:
+			}
+		case <-timeout:
+			s.debug.noteFailure(DebugFailureStreamRecvTimeout, "recv timeout")
+			s.connection.debug.noteFailure(DebugFailureStreamRecvTimeout, "stream recv timeout")
+			return rawMessage{}, ErrRecvTimeout{}
+		}
 		if !ok {
 			return rawMessage{}, ErrClosed{}
 		}
+		if s.staleReplies > 0 {
+			s.staleReplies--
+			continue
+		}
 		s.noteReceivedMessage()
 		return msg, nil
-	case <-s.connection.closeCh:
-		return rawMessage{}, ErrClosed{}
-	case <-timer.C:
-		s.debug.noteFailure(DebugFailureStreamRecvTimeout, "recv timeout")
-		s.connection.debug.noteFailure(DebugFailureStreamRecvTimeout, "stream recv timeout")
-		return rawMessage{}, ErrRecvTimeout{}
 	}
 }
 
@@ -269,6 +296,9 @@ func (s *Stream) sendBoxed(msg Message) error {
 		return ErrClosed{}
 	}
 	payload, err := s.connection.encodeMessage(msg)
+	if err == nil && uint64(len(payload)) > uint64(s.connection.config.maxFrame) {
+		err = ErrFrameTooLarge{Size: len(payload)}
+	}
 	if err != nil {
 		s.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
 		s.connection.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
@@ -285,66 +315,60 @@ func (s *Stream) sendBoxed(msg Message) error {
 	return nil
 }
 
-func (s *Stream) inboxQ(msg rawMessage) (err error) {
-	defer func() {
-		if recover() != nil {
-			err = ErrClosed{}
-		}
-	}()
+func (s *Stream) inboxQ(msg rawMessage) error {
 	select {
 	case s.inbox <- msg:
 		return nil
+	case <-s.done:
+		return ErrClosed{}
 	case <-s.connection.closeCh:
 		return ErrClosed{}
 	}
 }
 
-func (s *Stream) incomingQ(payload []byte) (err error) {
+func (s *Stream) incomingQ(payload []byte) error {
 	if s.incoming == nil {
 		return ErrClosed{}
 	}
-	defer func() {
-		if recover() != nil {
-			err = ErrClosed{}
-		}
-	}()
 	select {
 	case s.incoming <- payload:
 		return nil
+	case <-s.done:
+		return ErrClosed{}
 	case <-s.connection.closeCh:
 		return ErrClosed{}
 	}
 }
 
-func (s *Stream) handlerQ(job handlerJob) (err error) {
+// queueFIN queues the peer's FIN as a nil payload behind the frames already
+// received, so the decode loop closes the stream only after delivering them.
+func (s *Stream) queueFIN() {
+	_ = s.incomingQ(nil)
+}
+
+func (s *Stream) handlerQ(job handlerJob) error {
 	if s.handlerCh == nil {
 		return ErrClosed{}
 	}
-	defer func() {
-		if recover() != nil {
-			err = ErrClosed{}
-		}
-	}()
 	select {
 	case s.handlerCh <- job:
 		return nil
+	case <-s.done:
+		return ErrClosed{}
 	case <-s.connection.closeCh:
 		return ErrClosed{}
 	}
 }
 
+// close signals done. The data channels are closed only by their sole
+// sender, so no send can race with a close: the decode loop closes inbox and
+// handlerCh when it exits, and incoming is never closed.
 func (s *Stream) close() bool {
 	closed := false
 	s.closeOnce.Do(func() {
 		closed = true
 		s.closed.Store(true)
-		close(s.inbox)
-		if s.incoming != nil {
-			close(s.incoming)
-		}
-		if s.handlerCh != nil {
-			close(s.handlerCh)
-		}
+		close(s.done)
 	})
 	return closed
 }

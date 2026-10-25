@@ -40,7 +40,7 @@ func benchmarkProtocolSendRecv(b *testing.B, recoveryEnabled bool) {
 	b.Helper()
 
 	server := NewServer()
-	client := NewClient().WithTimeout(2 * time.Second)
+	client := NewClient().WithConnectTimeout(2 * time.Second)
 	if recoveryEnabled {
 		server = server.WithRecovery(ServerRecoveryOptions{
 			Enable:            true,

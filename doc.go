@@ -59,7 +59,7 @@
 //
 //	// ── client ──
 //	conn, err := adaptivemsg.NewClient().
-//		WithTimeout(5 * time.Second).
+//		WithConnectTimeout(5 * time.Second).
 //		Connect("tcp://127.0.0.1:9000")
 //	if err != nil { log.Fatal(err) }
 //	defer conn.Close()
@@ -67,5 +67,5 @@
 //	reply, err := conn.SendRecv[*Pong](&Ping{Text: "hello"})
 //
 // For one-shot request/reply without keeping a connection open, see
-// [Client.SendRecv].
+// [Client.ConnectOnce].
 package adaptivemsg

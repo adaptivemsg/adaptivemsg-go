@@ -154,7 +154,7 @@ func TestStreamRecvInterfaceUnknown(t *testing.T) {
 
 func TestStreamTypeMismatchCloses(t *testing.T) {
 	conn := &Connection{
-		config:   connConfig{codecID: CodecMsgpackMap, codec: mustCodec(t, CodecMsgpackMap)},
+		config:   connConfig{codecID: CodecMsgpackMap, codec: mustCodec(t, CodecMsgpackMap), maxFrame: defaultMaxFrame},
 		outbound: make(chan outboundFrame, 1),
 		streams:  make(map[uint32]*StreamContext),
 		closeCh:  make(chan struct{}),
@@ -163,6 +163,7 @@ func TestStreamTypeMismatchCloses(t *testing.T) {
 		id:         1,
 		connection: conn,
 		inbox:      make(chan rawMessage, 1),
+		done:       make(chan struct{}),
 	}
 	conn.streams[1] = &StreamContext{stream: stream}
 
@@ -174,12 +175,9 @@ func TestStreamTypeMismatchCloses(t *testing.T) {
 	}
 
 	select {
-	case _, ok := <-stream.inbox:
-		if ok {
-			t.Fatalf("expected inbox closed")
-		}
+	case <-stream.done:
 	default:
-		t.Fatalf("expected inbox closed")
+		t.Fatalf("expected stream closed")
 	}
 
 	select {

@@ -105,7 +105,8 @@ Protocol error codes:
 
 ## Concurrency And Lifetimes
 
-- Exactly one in-flight `Recv`/`SendRecv` per stream.
+- One conversation per stream: exactly one in-flight `Recv`/`PeekWire`/`SendRecv`. A concurrent call returns `ErrConcurrentRecv`, and a rejected `SendRecv` sends nothing. Open one stream per concurrent conversation.
+- After `SendRecv` returns `ErrRecvTimeout`, the stream discards the late reply when it arrives, so the next request receives its own reply.
 - `SetRecvTimeout(0)` disables timeout.
 - `Stream.Close()` sends a `FIN` data frame before releasing the local stream, but only on streams this side opened with `NewStream`. Other streams, including stream 0, are released locally.
 - Stream state is per stream (`SetState` / `State[T]`).
@@ -189,6 +190,17 @@ Minimum replay design in use:
 
 Send acceptance semantics:
 - `Send()` means local acceptance into logical outbound path, not peer receipt.
+
+### Close Lifecycle
+
+`Close()` (v2 and v3):
+- stops accepting new sends
+- writes the frames already queued, then, in v3, a `CLOSE` control frame
+- half-closes the transport and waits for the peer to close its side, at most 5 seconds in total; closing a socket with unread data would reset the connection and lose frames the peer has not read yet
+
+On a clean close by the peer (v2: EOF at a frame boundary; v3: `CLOSE`):
+- each stream delivers the frames received before the close, at most 5 seconds in total
+- the connection then closes permanently; a v3 server does not wait for `DetachedTTL`
 
 ### Detach Lifecycle
 
@@ -306,6 +318,9 @@ Control payloads:
   - bytes `1..8`: `last_recv_seq` (`u64`)
 - PING (`type=2`, total 1 byte)
   - byte `0`: `2`
+- CLOSE (`type=3`, total 1 byte)
+  - byte `0`: `3`
+  - sent by `Close()` after the queued data frames; the receiver delivers the frames received before it and closes the logical connection permanently instead of detaching
 
 Control frames are not replayed and do not consume sequence numbers.
 
@@ -328,6 +343,7 @@ Control frames are not replayed and do not consume sequence numbers.
 - implement v3 `seq` at bytes `10..17` of frame header
 - encode/decode ACK as exact 9-byte payload
 - encode/decode PING as exact 1-byte payload
+- encode/decode CLOSE as exact 1-byte payload; on CLOSE close the logical connection instead of detaching
 - treat heartbeat timeout as transport failure and trigger resume path
 - do not rely on PONG semantics
 

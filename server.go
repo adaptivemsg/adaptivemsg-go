@@ -35,6 +35,7 @@ func (n Netconn) PeerAddr() string {
 type Server struct {
 	registry      *registry
 	codecs        []CodecID
+	maxFrame      uint32
 	recovery      ServerRecoveryOptions
 	recoveryMu    sync.Mutex
 	recoveryConns map[recoveryToken]*Connection
@@ -45,12 +46,13 @@ type Server struct {
 }
 
 // NewServer returns a Server with default settings: both MessagePack codecs
-// supported ([CodecMsgpackCompact] and [CodecMsgpackMap]), recovery disabled,
-// and no lifecycle callbacks registered.
+// supported ([CodecMsgpackCompact] and [CodecMsgpackMap]), a 16 MiB max frame
+// size, recovery disabled, and no lifecycle callbacks registered.
 func NewServer() *Server {
 	return &Server{
 		registry:      newRegistrySnapshot(),
 		codecs:        []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
+		maxFrame:      defaultMaxFrame,
 		recovery:      defaultServerRecoveryOptions(),
 		recoveryConns: make(map[recoveryToken]*Connection),
 	}
@@ -97,6 +99,15 @@ func (s *Server) OnCloseStream(f func(*StreamContext)) *Server {
 // fails with [ErrNoCommonCodec].
 func (s *Server) WithCodecs(codecs ...CodecID) *Server {
 	s.codecs = append([]CodecID(nil), codecs...)
+	return s
+}
+
+// WithMaxFrame sets the maximum payload size per frame that the server
+// accepts and advertises during the handshake. The effective limit for a
+// connection is the minimum of the client's and the server's values. A
+// larger frame closes the connection. The default is 16 MiB.
+func (s *Server) WithMaxFrame(maxFrame uint32) *Server {
+	s.maxFrame = maxFrame
 	return s
 }
 
@@ -166,7 +177,7 @@ func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
 	if s.registry == nil {
 		s.registry = newRegistrySnapshot()
 	}
-	config, err := handshakeServer(conn, s.codecs, defaultMaxFrame, s.recovery.Enable)
+	config, err := handshakeServer(conn, s.codecs, s.maxFrame, s.recovery.Enable)
 	if err != nil {
 		_ = conn.Close()
 		return

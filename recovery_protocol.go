@@ -13,6 +13,9 @@ const (
 
 	controlTypeAck  = 1
 	controlTypePing = 2
+	// controlTypeClose tells the peer that the connection is closed for good, so
+	// it is released without waiting for a reconnect.
+	controlTypeClose = 3
 
 	attachModeNew    = 1
 	attachModeResume = 2
@@ -25,6 +28,7 @@ const (
 	attachResponseLen   = 60
 	controlAckFrameLen  = 9
 	controlHeartbeatLen = 1
+	controlCloseLen     = 1
 )
 
 type recoveryToken [recoveryTokenLen]byte
@@ -188,6 +192,10 @@ func buildPingControlPayload() []byte {
 	return []byte{controlTypePing}
 }
 
+func buildCloseControlPayload() []byte {
+	return []byte{controlTypeClose}
+}
+
 func parseControlPayload(payload []byte) (byte, uint64, error) {
 	if len(payload) == 0 {
 		return 0, 0, ErrInvalidMessage{Reason: "empty control payload"}
@@ -201,6 +209,11 @@ func parseControlPayload(payload []byte) (byte, uint64, error) {
 	case controlTypePing:
 		if len(payload) != controlHeartbeatLen {
 			return 0, 0, ErrInvalidMessage{Reason: "invalid heartbeat control payload length"}
+		}
+		return payload[0], 0, nil
+	case controlTypeClose:
+		if len(payload) != controlCloseLen {
+			return 0, 0, ErrInvalidMessage{Reason: "invalid close control payload length"}
 		}
 		return payload[0], 0, nil
 	default:
