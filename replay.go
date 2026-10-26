@@ -61,7 +61,9 @@ func (b *replayBuffer) add(frame outboundFrame) (*frameRecord, error) {
 
 	nextUsed := b.usedBytes + size
 	if b.maxBytes > 0 && nextUsed > b.maxBytes {
-		return nil, ErrReplayBufferFull{Limit: b.maxBytes, Size: nextUsed}
+		// The writer waits for room first (see fits), so this only rejects a
+		// frame larger than the whole buffer.
+		return nil, ErrFrameTooLarge{Size: len(frame.payload)}
 	}
 
 	record := &frameRecord{
@@ -76,6 +78,22 @@ func (b *replayBuffer) add(frame outboundFrame) (*frameRecord, error) {
 	})
 	b.usedBytes = nextUsed
 	return record, nil
+}
+
+// fits reports whether frame fits next to the frames already kept, and
+// whether it would fit once they are all acknowledged. Errors are left to
+// add.
+func (b *replayBuffer) fits(frame outboundFrame) (now, ever bool) {
+	if b == nil || b.maxBytes <= 0 {
+		return true, true
+	}
+	size, err := replayEntrySize(b.version, frame)
+	if err != nil {
+		return true, true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.usedBytes+size <= b.maxBytes, size <= b.maxBytes
 }
 
 func (b *replayBuffer) ack(lastSeq uint64) int64 {

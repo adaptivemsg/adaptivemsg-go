@@ -2,7 +2,9 @@ package adaptivemsg
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -402,6 +404,74 @@ func TestRecoveryQueuesSendWhileDetached(t *testing.T) {
 	}
 	if reply.Text != "queued" {
 		t.Fatalf("reply got %q want %q", reply.Text, "queued")
+	}
+}
+
+// detachedRecoveryConn connects, then stops the server and breaks the
+// transport. No reconnect succeeds, so the connection stays detached.
+func detachedRecoveryConn(t *testing.T, maxReplayBytes int64) *Connection {
+	t.Helper()
+	server := NewServer().WithRecovery(recoveryTestServerOptions())
+	addr, stop := startRecoveryTestServer(t, server)
+	opts := recoveryTestClientOptions()
+	opts.MaxReplayBytes = maxReplayBytes
+	conn, err := NewClient().WithRecovery(opts).Connect("tcp://" + addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	stop()
+	_ = conn.currentTransportForTest().Close()
+	waitForCondition(t, time.Second, func() bool { return conn.currentTransportForTest() == nil })
+	return conn
+}
+
+func TestRecoverySendReturnsWhileDetached(t *testing.T) {
+	conn := detachedRecoveryConn(t, 1<<20)
+	defer conn.Close()
+
+	const count = 10
+	done := make(chan error, 1)
+	go func() {
+		for range count {
+			if err := conn.Send(&connTestEchoRequest{Text: "queued"}); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Send while detached: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send blocked while detached")
+	}
+	if got := conn.DebugState().Recovery.ReplayQueued; got < count {
+		t.Fatalf("replay buffer holds %d frames, want at least %d", got, count)
+	}
+}
+
+func TestRecoveryCloseDoesNotWaitForHeldFrameWhileDetached(t *testing.T) {
+	conn := detachedRecoveryConn(t, 1<<10)
+	text := strings.Repeat("x", 600)
+	if err := conn.Send(&connTestEchoRequest{Text: text}); err != nil {
+		t.Fatalf("first Send: %v", err)
+	}
+
+	// The second Send does not fit until an ACK, which cannot come while
+	// detached.
+	held := make(chan error, 1)
+	go func() { held <- conn.Send(&connTestEchoRequest{Text: text}) }()
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	conn.Close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v", elapsed)
+	}
+	if err := <-held; !errors.As(err, &ErrClosed{}) {
+		t.Fatalf("held Send got %v, want ErrClosed", err)
 	}
 }
 

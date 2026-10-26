@@ -14,8 +14,10 @@ func (e ErrCodec) Error() string {
 	return "codec error: " + e.Message
 }
 
-// ErrFrameTooLarge indicates that a payload exceeded the negotiated maximum
-// frame size for the connection. The receiver will reject the frame.
+// ErrFrameTooLarge is returned by a send whose message is larger than the
+// connection accepts: the negotiated maximum frame size or, with recovery,
+// MaxReplayBytes. The message is not sent and the connection stays usable. A
+// received frame above the maximum frame size closes the connection.
 type ErrFrameTooLarge struct {
 	// Size is the offending payload size in bytes.
 	Size int
@@ -108,20 +110,6 @@ type ErrConnectTimeout struct{}
 
 func (e ErrConnectTimeout) Error() string {
 	return "connect timeout"
-}
-
-// ErrReplayBufferFull indicates that the recovery replay buffer has exceeded
-// the configured MaxReplayBytes limit. The connection will be terminated
-// because unacknowledged frames can no longer be retained for replay.
-type ErrReplayBufferFull struct {
-	// Limit is the configured maximum replay buffer size in bytes.
-	Limit int64
-	// Size is the current replay buffer size in bytes.
-	Size int64
-}
-
-func (e ErrReplayBufferFull) Error() string {
-	return fmt.Sprintf("replay buffer full: size=%d limit=%d", e.Size, e.Limit)
 }
 
 // ErrResumeRejected indicates that the server rejected a resume attempt.

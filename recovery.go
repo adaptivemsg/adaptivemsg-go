@@ -16,7 +16,10 @@ type ClientRecoveryOptions struct {
 	// attempts. Default: 2s.
 	ReconnectMaxBackoff time.Duration
 	// MaxReplayBytes is the maximum number of bytes buffered for replay of
-	// unacknowledged messages. Default: 8 MiB.
+	// unacknowledged messages; while it is reached, sends wait for the peer
+	// to acknowledge earlier ones. Default: 32 MiB, twice the default max
+	// frame, so that a frame of the largest size fits while another is still
+	// unacknowledged. Raise it together with [Client.WithMaxFrame].
 	MaxReplayBytes int64
 }
 
@@ -32,7 +35,10 @@ type ServerRecoveryOptions struct {
 	// before discarding it. Default: 30s.
 	DetachedTTL time.Duration
 	// MaxReplayBytes is the maximum number of bytes buffered for replay of
-	// unacknowledged messages. Default: 8 MiB.
+	// unacknowledged messages; while it is reached, sends wait for the peer
+	// to acknowledge earlier ones. Default: 32 MiB, twice the default max
+	// frame, so that a frame of the largest size fits while another is still
+	// unacknowledged. Raise it together with [Server.WithMaxFrame].
 	MaxReplayBytes int64
 	// AckEvery sends a cumulative ACK every N data frames. Default: 64.
 	AckEvery uint32
@@ -57,14 +63,14 @@ func defaultClientRecoveryOptions() ClientRecoveryOptions {
 	return ClientRecoveryOptions{
 		ReconnectMinBackoff: 100 * time.Millisecond,
 		ReconnectMaxBackoff: 2 * time.Second,
-		MaxReplayBytes:      8 << 20,
+		MaxReplayBytes:      2 * defaultMaxFrame,
 	}
 }
 
 func defaultServerRecoveryOptions() ServerRecoveryOptions {
 	return ServerRecoveryOptions{
 		DetachedTTL:       30 * time.Second,
-		MaxReplayBytes:    8 << 20,
+		MaxReplayBytes:    2 * defaultMaxFrame,
 		AckEvery:          64,
 		AckDelay:          20 * time.Millisecond,
 		HeartbeatInterval: 30 * time.Second,

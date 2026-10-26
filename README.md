@@ -181,7 +181,7 @@ Protocol/compat errors:
   `ErrBadHandshakeMagic`, `ErrFrameTooLarge`, `ErrUnsupportedTransport`, `ErrResumeRejected`.
 
 Runtime errors:
-- `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`, `ErrReplayBufferFull`.
+- `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`.
 
 Remote errors:
 - `ErrorReply` is sent by the peer; `SendRecv` surfaces it as `ErrRemote{Code, Message}`.
@@ -197,7 +197,7 @@ Notes:
 - Connections act as the default stream; use `conn.SendRecv[Reply](msg)` for request-reply and `stream.Recv[Message]()` for dynamic receive.
 - A stream carries one conversation at a time: `Recv`, `PeekWire` and `SendRecv` must not run concurrently on the same stream, and the extra call returns `ErrConcurrentRecv` (a rejected `SendRecv` sends nothing). Open one stream per concurrent request-reply. After `SendRecv` returns `ErrRecvTimeout`, the stream discards the late reply, so the next request receives its own reply.
 - `Connection.Close()` delivers the messages already queued by `Send`: it writes them, tells the peer, and waits for the peer to close its side, at most 5 seconds. With recovery, the server then releases the connection at once instead of keeping it for `DetachedTTL`.
-- Frames are limited to 16 MiB by default; the limit is the smaller of `Client.WithMaxFrame` and `Server.WithMaxFrame`. `Send` returns `ErrFrameTooLarge` for a larger message and the connection stays usable.
+- Frames are limited to 16 MiB by default; the limit is the smaller of `Client.WithMaxFrame` and `Server.WithMaxFrame`. `Send` returns `ErrFrameTooLarge` for a larger message and the connection stays usable. With recovery, messages awaiting acknowledgement are kept in a replay buffer of `MaxReplayBytes` (32 MiB by default, twice the max frame); raise both together.
 - `Client.WithConnectTimeout` sets how long establishing a connection may take: failed dials are retried until then, and with recovery it also limits each reconnect attempt. Without it the client dials once. `Client.WithRecvTimeout` sets the initial recv timeout of every stream; `SetRecvTimeout` changes it for one stream.
 - Register handler/message types with `MustRegister` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
@@ -215,6 +215,7 @@ Notes:
 - Recovery is client-driven: the dialing side reconnects and the server reattaches the new transport to the existing logical connection.
 - The server is authoritative for shared recovery wire behavior. ACK batching and heartbeat settings are chosen by the server and sent to the client during attach/resume.
 - `Recv()` can continue waiting across reconnect, and queued/unacknowledged outbound frames are replayed after resume.
+- `Send()` keeps working while the transport is down: the message waits in the replay buffer and is sent after the reconnect. While `MaxReplayBytes` of messages await acknowledgement, `Send()` waits; only a message larger than `MaxReplayBytes` fails, with `ErrFrameTooLarge`.
 - `WaitClosed()` and `ErrClosed` refer to permanent logical closure, not a transient reconnectable transport loss.
 - Server `OnConnect` runs for the initial logical connection, not for every resumed transport; `OnDisconnect` runs on permanent logical close.
 - `Close()` sends a `CLOSE` control frame after the queued messages, so the peer closes the logical connection at once. A transport lost without `CLOSE` is kept for `DetachedTTL` so the client can reconnect.
@@ -222,11 +223,11 @@ Notes:
 - `ClientRecoveryOptions` controls:
   - `Enable`: turn recovery on.
   - `ReconnectMinBackoff` / `ReconnectMaxBackoff`: client reconnect backoff range.
-  - `MaxReplayBytes`: client-side byte cap for retained unacknowledged outbound frames.
+  - `MaxReplayBytes`: client-side byte cap for retained unacknowledged outbound frames. Default 32 MiB, twice the default max frame.
 - `ServerRecoveryOptions` controls:
   - `Enable`: turn recovery on.
   - `DetachedTTL`: how long the server keeps a logical connection whose transport was lost without `CLOSE`.
-  - `MaxReplayBytes`: server-side byte cap for retained unacknowledged outbound frames.
+  - `MaxReplayBytes`: server-side byte cap for retained unacknowledged outbound frames. Default 32 MiB, twice the default max frame.
   - `AckEvery` / `AckDelay`: server-selected cumulative ACK batching policy.
   - `HeartbeatInterval` / `HeartbeatTimeout`: server-selected idle failure detection policy for quiet connections.
 

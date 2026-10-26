@@ -125,6 +125,18 @@ func (c *Connection) waitForTransport(lastGen uint64) (net.Conn, uint64, uint64,
 	}
 }
 
+// attachedTransport is waitForTransport without the wait: ok is false while
+// no transport newer than lastGen is attached.
+func (c *Connection) attachedTransport(lastGen uint64) (net.Conn, uint64, uint64, bool) {
+	c.initTransportState()
+	c.transportMu.Lock()
+	defer c.transportMu.Unlock()
+	if c.conn != nil && c.transportGen != lastGen {
+		return c.conn, c.transportGen, c.transportResume, true
+	}
+	return nil, 0, 0, false
+}
+
 func (c *Connection) transportActive(gen uint64, conn net.Conn) bool {
 	c.initTransportState()
 	c.transportMu.Lock()
@@ -465,9 +477,29 @@ func (c *Connection) reconnectLoop() {
 func (c *Connection) recoveryWriterLoop() {
 	var lastGen uint64
 	var waitTimer *time.Timer
+	// held is a frame that does not fit in the replay buffer yet. While it is
+	// held no other frame is taken, so its sender, and the senders queued
+	// behind it, wait until an ACK frees room.
+	var held *outboundFrame
+	outbound := func() chan outboundFrame {
+		if held != nil {
+			return nil
+		}
+		return c.outbound
+	}
 	stageLive := func(frame outboundFrame) (*frameRecord, bool) {
+		if now, ever := c.recovery.replay.fits(frame); !now && ever {
+			held = &frame
+			return nil, false
+		}
 		frame.seq = c.nextOutboundSeq()
 		record, err := c.recovery.replay.add(frame)
+		if err != nil {
+			// Give the unused sequence number back: the peer closes the
+			// connection when a number is skipped. Only this goroutine takes
+			// numbers.
+			c.nextSendSeq.Add(^uint64(0))
+		}
 		if frame.queued != nil {
 			frame.queued <- err
 		}
@@ -491,9 +523,22 @@ func (c *Connection) recoveryWriterLoop() {
 		}
 	}()
 	for {
-		conn, gen, resumeSeq, err := c.waitForTransport(lastGen)
-		if err != nil {
-			return
+		conn, gen, resumeSeq, ok := c.attachedTransport(lastGen)
+		if !ok {
+			// Frames sent while no transport is attached are staged, and the
+			// resume replays them.
+			select {
+			case <-c.closeCh:
+				return
+			case <-c.sendNotify:
+			case frame := <-outbound():
+				if frame.closing != nil {
+					close(frame.closing)
+					return
+				}
+				stageLive(frame)
+			}
+			continue
 		}
 		lastGen = gen
 		lastSentSeq := resumeSeq
@@ -514,7 +559,7 @@ func (c *Connection) recoveryWriterLoop() {
 				}
 				// Batch: also write a pending live frame before flushing
 				select {
-				case frame := <-c.outbound:
+				case frame := <-outbound():
 					if frame.closing != nil {
 						c.finishRecoveryWriter(bw, frame.closing)
 						return
@@ -554,9 +599,24 @@ func (c *Connection) recoveryWriterLoop() {
 				lastSentSeq = resumeFrame.seq
 				continue
 			}
+			if held != nil {
+				frame := *held
+				held = nil
+				if stored, ok := stageLive(frame); ok {
+					if stored.seq > lastSentSeq {
+						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
+							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
+							c.handleRecoveryTransportError(conn)
+							break
+						}
+						lastSentSeq = stored.seq
+					}
+					continue
+				}
+			}
 			var frame outboundFrame
 			select {
-			case frame = <-c.outbound:
+			case frame = <-outbound():
 			default:
 				frame = outboundFrame{}
 			}
@@ -591,7 +651,7 @@ func (c *Connection) recoveryWriterLoop() {
 				case <-c.closeCh:
 					return
 				case <-c.sendNotify:
-				case frame := <-c.outbound:
+				case frame := <-outbound():
 					if frame.closing != nil {
 						c.finishRecoveryWriter(bw, frame.closing)
 						return
@@ -625,7 +685,7 @@ func (c *Connection) recoveryWriterLoop() {
 				return
 			case <-c.sendNotify:
 				stopAndDrain()
-			case frame := <-c.outbound:
+			case frame := <-outbound():
 				stopAndDrain()
 				if frame.closing != nil {
 					c.finishRecoveryWriter(bw, frame.closing)
@@ -724,6 +784,8 @@ func (c *Connection) handleControlFrame(payload []byte) (bool, error) {
 	switch controlType {
 	case controlTypeAck:
 		c.recovery.ackReceived(value)
+		// The writer may hold a frame waiting for the room this frees.
+		c.signalSend()
 		return false, nil
 	case controlTypePing:
 		// Liveness is already enforced by SetReadDeadline and periodic ping.

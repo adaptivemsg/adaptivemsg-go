@@ -101,7 +101,7 @@ func TestReplayBufferSnapshotFromSeq(t *testing.T) {
 	}
 }
 
-func TestReplayBufferFull(t *testing.T) {
+func TestReplayBufferRejectsFrameLargerThanBuffer(t *testing.T) {
 	frame := outboundFrame{
 		streamID: 1,
 		seq:      1,
@@ -113,16 +113,38 @@ func TestReplayBufferFull(t *testing.T) {
 	}
 
 	buffer := newReplayBuffer(protocolVersionV3, size-1)
+	if now, ever := buffer.fits(frame); now || ever {
+		t.Fatalf("fits got now=%v ever=%v, want false, false", now, ever)
+	}
 	_, err = buffer.add(frame)
 
-	var full ErrReplayBufferFull
-	if !errors.As(err, &full) {
-		t.Fatalf("expected ErrReplayBufferFull, got %v", err)
+	var tooLarge ErrFrameTooLarge
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
 	}
-	if full.Limit != size-1 {
-		t.Fatalf("limit got %d want %d", full.Limit, size-1)
+	if tooLarge.Size != len(frame.payload) {
+		t.Fatalf("size got %d want %d", tooLarge.Size, len(frame.payload))
 	}
-	if full.Size != size {
-		t.Fatalf("size got %d want %d", full.Size, size)
+}
+
+func TestReplayBufferFitsAfterAck(t *testing.T) {
+	first := outboundFrame{streamID: 1, seq: 1, payload: []byte("payload")}
+	size, err := replayEntrySize(protocolVersionV3, first)
+	if err != nil {
+		t.Fatalf("replayEntrySize: %v", err)
+	}
+	buffer := newReplayBuffer(protocolVersionV3, size)
+	if _, err := buffer.add(first); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	second := first
+	second.seq = 2
+	if now, ever := buffer.fits(second); now || !ever {
+		t.Fatalf("fits got now=%v ever=%v, want false, true", now, ever)
+	}
+	buffer.ack(1)
+	if now, _ := buffer.fits(second); !now {
+		t.Fatal("fits after the ACK got now=false, want true")
 	}
 }

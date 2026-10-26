@@ -190,6 +190,8 @@ Minimum replay design in use:
 
 Send acceptance semantics:
 - `Send()` means local acceptance into logical outbound path, not peer receipt.
+- v3: `Send()` returns once the frame is in the replay buffer, also while detached; the resume writes it.
+- v3: when the next frame does not fit in `MaxReplayBytes`, the writer holds it and takes no further frames until an ACK frees room, so `Send()` waits and order is kept. Only a frame larger than `MaxReplayBytes` fails, with `ErrFrameTooLarge`.
 
 ### Close Lifecycle
 
@@ -419,10 +421,12 @@ Rules:
 ### Delivery, ACK, And Replay Rules
 
 Outbound data send:
-- allocate next connection sequence
 - encode frame
-- retain frame in replay storage
 - enqueue frame for writer
+- writer waits until the frame fits in replay storage
+- allocate next connection sequence
+- retain frame in replay storage
+- write it if a transport is attached; otherwise the resume does
 
 Inbound data receive:
 - if `seq == lastRecvSeq + 1`: accept and deliver

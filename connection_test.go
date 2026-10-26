@@ -291,6 +291,64 @@ func TestSendAfterCloseFails(t *testing.T) {
 	}
 }
 
+func TestMessageLargerThanReplayBufferFailsOnlyThatSend(t *testing.T) {
+	server := NewServer().WithRecovery(ServerRecoveryOptions{Enable: true})
+	addr, stop := startClientTestServer(t, server)
+	defer stop()
+	conn, err := NewClient().
+		WithRecvTimeout(2 * time.Second).
+		WithRecovery(ClientRecoveryOptions{Enable: true, MaxReplayBytes: 1 << 10}).
+		Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	big := &connTestEchoRequest{Text: strings.Repeat("x", 2<<10)}
+	if err := conn.Send(big); !errors.As(err, &ErrFrameTooLarge{}) {
+		t.Fatalf("Send got %v, want ErrFrameTooLarge", err)
+	}
+	reply, err := conn.SendRecv[*connTestEchoReply](&connTestEchoRequest{Text: "small"})
+	if err != nil {
+		t.Fatalf("SendRecv after the rejected Send: %v", err)
+	}
+	if reply.Text != "small" {
+		t.Fatalf("reply got %q, want %q", reply.Text, "small")
+	}
+}
+
+func TestSendWaitsWhileReplayBufferIsFull(t *testing.T) {
+	server := NewServer().WithRecovery(ServerRecoveryOptions{Enable: true})
+	addr, stop := startClientTestServer(t, server)
+	defer stop()
+	conn, err := NewClient().
+		WithRecvTimeout(5 * time.Second).
+		WithRecovery(ClientRecoveryOptions{Enable: true, MaxReplayBytes: 4 << 10}).
+		Connect(addr)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	// 50 KiB through a 4 KiB buffer: each Send waits for room instead of failing.
+	const count = 50
+	text := strings.Repeat("x", 1<<10)
+	for i := range count {
+		if err := conn.Send(&connTestEchoRequest{Text: strconv.Itoa(i) + text}); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+	for i := range count {
+		reply, err := conn.Recv[*connTestEchoReply]()
+		if err != nil {
+			t.Fatalf("Recv %d: %v", i, err)
+		}
+		if want := strconv.Itoa(i) + text; reply.Text != want {
+			t.Fatalf("reply %d out of order", i)
+		}
+	}
+}
+
 func TestRecoveryCloseReleasesServerConnection(t *testing.T) {
 	disconnected := make(chan struct{}, 1)
 	server := NewServer().

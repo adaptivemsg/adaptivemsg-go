@@ -260,7 +260,8 @@ func (c *Connection) WaitClosed() {
 
 // Send encodes msg and writes it on the default stream (stream 0). The call
 // is fire-and-forget: it returns once the frame is queued for the writer
-// goroutine. It returns [ErrClosed] if the connection has been shut down.
+// goroutine. It returns [ErrClosed] if the connection has been shut down. See
+// [Stream.Send].
 func (c *Connection) Send(msg Message) error {
 	return c.defaultStream().Send(msg)
 }

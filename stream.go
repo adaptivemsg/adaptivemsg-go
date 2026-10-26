@@ -91,7 +91,8 @@ func (s *Stream) SetRecvTimeout(timeout time.Duration) {
 
 // Send encodes msg with the negotiated codec and enqueues the resulting
 // frame for transmission on this stream. Send returns as soon as the frame
-// is queued; it does not wait for the peer to receive it.
+// is queued; it does not wait for the peer to receive it. With recovery, Send
+// waits while MaxReplayBytes of messages await acknowledgement.
 //
 // Send is safe for concurrent use. It returns [ErrClosed] if the
 // connection has been shut down.
