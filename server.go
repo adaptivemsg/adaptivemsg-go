@@ -1,9 +1,25 @@
 package adaptivemsg
 
 import (
+	"context"
+	"crypto/subtle"
 	"net"
-	"strings"
 	"sync"
+	"time"
+)
+
+// defaultHandshakeTimeout bounds the handshake and the v3 attach on an
+// accepted connection, so a peer that connects and sends nothing does not
+// hold a goroutine and a file descriptor. It leaves room for lossy links and
+// for a server that a burst of reconnects keeps busy.
+const defaultHandshakeTimeout = 2 * time.Minute
+
+// Bounds for the wait between attempts after Accept fails, for example with
+// EMFILE when the process is out of file descriptors; such errors clear once
+// connections close.
+const (
+	acceptRetryMinBackoff = 5 * time.Millisecond
+	acceptRetryMaxBackoff = time.Second
 )
 
 // Netconn is a lightweight descriptor for a peer connection, passed to
@@ -33,28 +49,45 @@ func (n Netconn) PeerAddr() string {
 // blocks for the lifetime of the server; it only returns if the underlying
 // listener encounters an unrecoverable error.
 type Server struct {
-	registry      *registry
-	codecs        []CodecID
-	maxFrame      uint32
-	recovery      ServerRecoveryOptions
-	recoveryMu    sync.Mutex
-	recoveryConns map[recoveryToken]*Connection
-	onConnect     func(Netconn) error
-	onDisconnect  func(Netconn) error
-	onNewStream   func(*StreamContext)
-	onCloseStream func(*StreamContext)
+	registry         *registry
+	codecs           []CodecID
+	maxFrame         uint32
+	handshakeTimeout time.Duration
+	streamQueueSize  int
+	recovery         ServerRecoveryOptions
+	recoveryMu       sync.Mutex
+	recoveryConns    map[recoveryToken]*Connection
+	onConnect        func(Netconn) error
+	onDisconnect     func(Netconn) error
+	onNewStream      func(*StreamContext)
+	onCloseStream    func(*StreamContext)
+
+	// lifecycleMu guards what Shutdown stops: the listeners, the connections
+	// still in the handshake, and the established connections.
+	lifecycleMu sync.Mutex
+	stopping    bool
+	stopCh      chan struct{}
+	listeners   map[net.Listener]struct{}
+	handshakes  map[net.Conn]struct{}
+	conns       map[*Connection]struct{}
+	// running counts the goroutines that serve connections, including those
+	// waiting to run OnDisconnect.
+	running sync.WaitGroup
 }
 
 // NewServer returns a Server with default settings: both MessagePack codecs
 // supported ([CodecMsgpackCompact] and [CodecMsgpackMap]), a 16 MiB max frame
-// size, recovery disabled, and no lifecycle callbacks registered.
+// size, a 2-minute handshake timeout, recovery disabled, and no lifecycle
+// callbacks registered.
 func NewServer() *Server {
 	return &Server{
-		registry:      newRegistrySnapshot(),
-		codecs:        []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
-		maxFrame:      defaultMaxFrame,
-		recovery:      defaultServerRecoveryOptions(),
-		recoveryConns: make(map[recoveryToken]*Connection),
+		registry:         newRegistrySnapshot(),
+		codecs:           []CodecID{CodecMsgpackCompact, CodecMsgpackMap},
+		maxFrame:         defaultMaxFrame,
+		handshakeTimeout: defaultHandshakeTimeout,
+		recovery:         defaultServerRecoveryOptions(),
+		recoveryConns:    make(map[recoveryToken]*Connection),
+		stopCh:           make(chan struct{}),
 	}
 }
 
@@ -111,6 +144,27 @@ func (s *Server) WithMaxFrame(maxFrame uint32) *Server {
 	return s
 }
 
+// WithHandshakeTimeout sets how long an accepted connection may take to
+// complete the handshake and, with recovery, the attach; the server closes a
+// connection that takes longer. Zero or a negative value disables the limit.
+// The default is 2 minutes. The limit no longer applies once [Server.OnConnect]
+// runs.
+func (s *Server) WithHandshakeTimeout(timeout time.Duration) *Server {
+	s.handshakeTimeout = timeout
+	return s
+}
+
+// WithStreamQueueSize sets how many received messages each stream buffers:
+// messages waiting for a handler or Recv, and frames waiting to be decoded.
+// When a stream's buffer is full, the connection stops reading until the
+// stream catches up, which holds up its other streams too. A smaller buffer
+// saves memory on connections with many streams but reaches that point
+// sooner. The default is 1024; zero or a negative value keeps the default.
+func (s *Server) WithStreamQueueSize(size int) *Server {
+	s.streamQueueSize = size
+	return s
+}
+
 // WithRecovery enables the v3 protocol extension on the server side, allowing
 // clients to reconnect and resume sessions after transient network failures.
 // See [ServerRecoveryOptions] for tunables such as detached TTL, replay buffer
@@ -120,9 +174,10 @@ func (s *Server) WithRecovery(opts ServerRecoveryOptions) *Server {
 	return s
 }
 
-// Serve binds to addr and enters an accept loop, blocking for the lifetime of
-// the server. Each accepted connection is handled in a dedicated goroutine
-// that performs the protocol handshake and then runs the reader/writer loops.
+// Serve binds to addr and enters an accept loop, blocking until
+// [Server.Shutdown]. Each accepted connection is handled in a dedicated
+// goroutine that performs the protocol handshake and then runs the
+// reader/writer loops.
 //
 // Supported address formats:
 //
@@ -130,16 +185,22 @@ func (s *Server) WithRecovery(opts ServerRecoveryOptions) *Server {
 //   - "uds:///path/to/sock" or "unix:///path/to/sock" — Unix domain socket
 //   - "host:port" — bare host:port defaults to TCP
 //
-// Serve returns a non-nil error only if the listener itself fails (e.g. the
-// address is already in use).
+// Serve returns an error if it cannot listen on addr, for example because the
+// address is already in use, and [ErrServerClosed] after [Server.Shutdown]. A
+// failed accept, for example when the process runs out of file descriptors,
+// does not end Serve: it waits briefly and accepts again.
 func (s *Server) Serve(addr string) error {
-	if strings.HasPrefix(addr, "tcp://") {
-		return s.serveTCP(strings.TrimPrefix(addr, "tcp://"))
+	if s.isStopping() {
+		return ErrServerClosed{}
 	}
-	if strings.HasPrefix(addr, "uds://") || strings.HasPrefix(addr, "unix://") {
-		return s.serveUDS(addr)
+	network, address, err := parseAddr(addr)
+	if err != nil {
+		return err
 	}
-	return s.serveTCP(addr)
+	if network == "unix" {
+		return s.serveUDS(address)
+	}
+	return s.serveTCP(address)
 }
 
 func (s *Server) serveTCP(addr string) error {
@@ -147,7 +208,7 @@ func (s *Server) serveTCP(addr string) error {
 	if err != nil {
 		return err
 	}
-	return s.serveWithAccept(func() (net.Conn, string, error) {
+	return s.serveListener(listener, func() (net.Conn, string, error) {
 		return acceptTCP(listener)
 	})
 }
@@ -157,25 +218,53 @@ func (s *Server) serveUDS(addr string) error {
 	if err != nil {
 		return err
 	}
-	return s.serveWithAccept(func() (net.Conn, string, error) {
+	return s.serveListener(listener, func() (net.Conn, string, error) {
 		return acceptUDS(listener)
 	})
 }
 
-func (s *Server) serveWithAccept(accept func() (net.Conn, string, error)) error {
+func (s *Server) serveListener(listener net.Listener, accept func() (net.Conn, string, error)) error {
+	if !s.trackListener(listener) {
+		_ = listener.Close()
+		return ErrServerClosed{}
+	}
+	defer func() {
+		s.untrackListener(listener)
+		_ = listener.Close()
+	}()
+	var backoff time.Duration
 	for {
 		conn, peer, err := accept()
 		if err != nil {
-			return err
+			if s.isStopping() {
+				return ErrServerClosed{}
+			}
+			backoff = min(max(2*backoff, acceptRetryMinBackoff), acceptRetryMaxBackoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-s.stopCh:
+				timer.Stop()
+				return ErrServerClosed{}
+			}
+			continue
 		}
-		netconn := Netconn{peerAddr: peer}
-		go s.handleConn(conn, netconn)
+		backoff = 0
+		if !s.beginHandshake(conn) {
+			_ = conn.Close()
+			return ErrServerClosed{}
+		}
+		go func() {
+			defer s.running.Done()
+			s.handleConn(conn, Netconn{peerAddr: peer})
+		}()
 	}
 }
 
 func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
-	if s.registry == nil {
-		s.registry = newRegistrySnapshot()
+	defer s.endHandshake(conn)
+	if s.handshakeTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	}
 	config, err := handshakeServer(conn, s.codecs, s.maxFrame, s.recovery.Enable)
 	if err != nil {
@@ -183,7 +272,8 @@ func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
 		return
 	}
 	if config.version != protocolVersionV3 {
-		pending := newPendingConnection(conn, s.registry, s.onNewStream, s.onCloseStream)
+		_ = conn.SetDeadline(time.Time{})
+		pending := s.pendingConnection(conn)
 		if s.onConnect != nil {
 			if err := s.onConnect(netconn); err != nil {
 				_ = conn.Close()
@@ -191,16 +281,23 @@ func (s *Server) handleConn(conn net.Conn, netconn Netconn) {
 			}
 		}
 		connection := pending.startWithConfig(config)
-		connection.WaitClosed()
-		if s.onDisconnect != nil {
-			_ = s.onDisconnect(netconn)
+		if !s.trackConn(connection, conn) {
+			connection.Close()
 		}
+		s.awaitClose(connection, netconn)
 		return
 	}
 
 	if err := s.handleRecoveryConn(conn, netconn, config); err != nil {
 		_ = conn.Close()
 	}
+}
+
+// pendingConnection wraps an accepted conn with the server's settings.
+func (s *Server) pendingConnection(conn net.Conn) *pendingConnection {
+	pending := newPendingConnection(conn, s.registry, s.onNewStream, s.onCloseStream)
+	pending.connection.streamQueueSize = s.streamQueueSize
+	return pending
 }
 
 func (s *Server) handleRecoveryConn(conn net.Conn, netconn Netconn, config connConfig) error {
@@ -211,75 +308,222 @@ func (s *Server) handleRecoveryConn(conn net.Conn, netconn Netconn, config connC
 
 	switch req.mode {
 	case attachModeNew:
-		connectionID, err := newRecoveryToken()
-		if err != nil {
-			return err
-		}
-		resumeSecret, err := newRecoveryToken()
-		if err != nil {
-			return err
-		}
-		pending := newPendingConnection(conn, s.registry, s.onNewStream, s.onCloseStream)
-		connection := pending.connection
-		connection.config = config
-		connection.recovery = newServerRecoveryState(s.recovery, s, connectionID, resumeSecret)
-		negotiated := s.recovery.negotiated()
-		s.storeRecoveryConnection(connectionID, connection)
-		if err := writeAttachResponse(conn, attachResponse{
-			status:       attachStatusOK,
-			connectionID: connectionID,
-			resumeSecret: resumeSecret,
-			lastRecvSeq:  0,
-			negotiated:   negotiated,
-		}); err != nil {
-			s.removeRecoveryConnection(connectionID, connection)
-			return err
-		}
-		connection.attachTransport(conn, 0)
-		if s.onConnect != nil {
-			if err := s.onConnect(netconn); err != nil {
-				connection.markClosed()
-				return err
-			}
-		}
-		connection.start()
-		if s.onDisconnect != nil {
-			go func() {
-				connection.WaitClosed()
-				_ = s.onDisconnect(netconn)
-			}()
-		}
-		return nil
-
+		return s.attachNew(conn, netconn, config)
 	case attachModeResume:
-		connection, ok := s.lookupRecoveryConnection(req.connectionID)
-		if !ok || connection == nil || connection.recovery == nil || connection.closed.Load() {
-			_ = writeAttachResponse(conn, attachResponse{status: attachStatusRejected})
-			return ErrResumeRejected{Reason: "connection not found"}
-		}
-		if connection.recovery.resumeSecret != req.resumeSecret {
-			_ = writeAttachResponse(conn, attachResponse{status: attachStatusRejected})
-			return ErrResumeRejected{Reason: "resume secret mismatch"}
-		}
-		if connection.config.codecID != config.codecID {
-			_ = writeAttachResponse(conn, attachResponse{status: attachStatusRejected})
-			return ErrResumeRejected{Reason: "codec mismatch"}
-		}
-		if err := writeAttachResponse(conn, attachResponse{
-			status:       attachStatusOK,
-			connectionID: connection.recovery.connectionID,
-			resumeSecret: connection.recovery.resumeSecret,
-			lastRecvSeq:  connection.recovery.lastReceived(),
-			negotiated:   connection.recovery.negotiated(),
-		}); err != nil {
+		return s.attachResume(conn, config, req)
+	default:
+		return rejectAttach(conn, "invalid attach mode")
+	}
+}
+
+// attachNew starts a new recovery connection.
+func (s *Server) attachNew(conn net.Conn, netconn Netconn, config connConfig) error {
+	connectionID, err := newRecoveryToken()
+	if err != nil {
+		return err
+	}
+	resumeSecret, err := newRecoveryToken()
+	if err != nil {
+		return err
+	}
+	connection := s.pendingConnection(conn).connection
+	connection.config = config
+	connection.recovery = newServerRecoveryState(s.recovery, s, connectionID, resumeSecret)
+	s.storeRecoveryConnection(connectionID, connection)
+	if err := writeAttachResponse(conn, attachResponse{
+		status:       attachStatusOK,
+		connectionID: connectionID,
+		resumeSecret: resumeSecret,
+		negotiated:   s.recovery.negotiated(),
+	}); err != nil {
+		s.removeRecoveryConnection(connectionID, connection)
+		return err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	connection.attachTransport(conn, 0)
+	if s.onConnect != nil {
+		if err := s.onConnect(netconn); err != nil {
+			connection.markClosed()
 			return err
 		}
-		connection.attachTransport(conn, req.lastRecvSeq)
-		return nil
-	default:
-		_ = writeAttachResponse(conn, attachResponse{status: attachStatusRejected})
-		return ErrResumeRejected{Reason: "invalid attach mode"}
 	}
+	connection.start()
+	if !s.trackConn(connection, conn) {
+		connection.Close()
+	}
+	s.running.Add(1)
+	go func() {
+		defer s.running.Done()
+		s.awaitClose(connection, netconn)
+	}()
+	return nil
+}
+
+// attachResume moves conn to the connection that a resume request names.
+func (s *Server) attachResume(conn net.Conn, config connConfig, req attachRequest) error {
+	connection, ok := s.lookupRecoveryConnection(req.connectionID)
+	if !ok || connection == nil || connection.recovery == nil || connection.closed.Load() {
+		return rejectAttach(conn, "connection not found")
+	}
+	recovery := connection.recovery
+	if subtle.ConstantTimeCompare(recovery.resumeSecret[:], req.resumeSecret[:]) != 1 {
+		return rejectAttach(conn, "resume secret mismatch")
+	}
+	if connection.config.codecID != config.codecID {
+		return rejectAttach(conn, "codec mismatch")
+	}
+	if err := writeAttachResponse(conn, attachResponse{
+		status:       attachStatusOK,
+		connectionID: recovery.connectionID,
+		resumeSecret: recovery.resumeSecret,
+		lastRecvSeq:  recovery.lastReceived(),
+		negotiated:   recovery.negotiated(),
+	}); err != nil {
+		return err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	connection.attachTransport(conn, req.lastRecvSeq)
+	return nil
+}
+
+// rejectAttach tells the client that its attach request is refused.
+func rejectAttach(conn net.Conn, reason string) error {
+	_ = writeAttachResponse(conn, attachResponse{status: attachStatusRejected})
+	return ErrResumeRejected{Reason: reason}
+}
+
+// awaitClose waits for connection to close, then runs OnDisconnect.
+func (s *Server) awaitClose(connection *Connection, netconn Netconn) {
+	connection.WaitClosed()
+	s.untrackConn(connection)
+	if s.onDisconnect != nil {
+		_ = s.onDisconnect(netconn)
+	}
+}
+
+// Shutdown stops the server. Every [Server.Serve] call stops accepting and
+// returns [ErrServerClosed], connections still in the handshake are dropped,
+// and established connections close as [Connection.Close] closes them:
+// messages already queued are delivered, and recovery sessions end instead of
+// waiting for the client to reconnect. Shutdown returns once every connection
+// has closed and its OnDisconnect callback has returned, or when ctx is done,
+// whichever comes first; in the latter case it returns ctx.Err() and the
+// connections go on closing. Calling Shutdown more than once is safe.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	if !s.stopping {
+		s.stopping = true
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	}
+	listeners := make([]net.Listener, 0, len(s.listeners))
+	for listener := range s.listeners {
+		listeners = append(listeners, listener)
+	}
+	handshakes := make([]net.Conn, 0, len(s.handshakes))
+	for conn := range s.handshakes {
+		handshakes = append(handshakes, conn)
+	}
+	conns := make([]*Connection, 0, len(s.conns))
+	for connection := range s.conns {
+		conns = append(conns, connection)
+	}
+	s.lifecycleMu.Unlock()
+
+	for _, listener := range listeners {
+		_ = listener.Close()
+	}
+	for _, conn := range handshakes {
+		_ = conn.Close()
+	}
+	for _, connection := range conns {
+		go connection.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.running.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) isStopping() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.stopping
+}
+
+// trackListener registers listener for Shutdown to close. It returns false
+// once Shutdown has begun.
+func (s *Server) trackListener(listener net.Listener) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	if s.listeners == nil {
+		s.listeners = make(map[net.Listener]struct{})
+	}
+	s.listeners[listener] = struct{}{}
+	return true
+}
+
+func (s *Server) untrackListener(listener net.Listener) {
+	s.lifecycleMu.Lock()
+	delete(s.listeners, listener)
+	s.lifecycleMu.Unlock()
+}
+
+// beginHandshake registers an accepted conn for Shutdown to close and counts
+// the goroutine that serves it. It returns false once Shutdown has begun.
+func (s *Server) beginHandshake(conn net.Conn) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	if s.handshakes == nil {
+		s.handshakes = make(map[net.Conn]struct{})
+	}
+	s.handshakes[conn] = struct{}{}
+	s.running.Add(1)
+	return true
+}
+
+// endHandshake forgets conn once it is closed or owned by a connection.
+func (s *Server) endHandshake(conn net.Conn) {
+	s.lifecycleMu.Lock()
+	delete(s.handshakes, conn)
+	s.lifecycleMu.Unlock()
+}
+
+// trackConn hands conn over to the established connection that now owns it,
+// for Shutdown to close. It returns false once Shutdown has begun; the caller
+// then closes the connection.
+func (s *Server) trackConn(connection *Connection, conn net.Conn) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	delete(s.handshakes, conn)
+	if s.stopping {
+		return false
+	}
+	if s.conns == nil {
+		s.conns = make(map[*Connection]struct{})
+	}
+	s.conns[connection] = struct{}{}
+	return true
+}
+
+func (s *Server) untrackConn(connection *Connection) {
+	s.lifecycleMu.Lock()
+	delete(s.conns, connection)
+	s.lifecycleMu.Unlock()
 }
 
 func (s *Server) storeRecoveryConnection(id recoveryToken, connection *Connection) {

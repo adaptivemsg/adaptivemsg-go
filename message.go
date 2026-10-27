@@ -73,11 +73,8 @@ func WireNameOf(msg Message) (string, error) {
 		}
 		return name, nil
 	}
-	t := reflect.TypeOf(msg)
-	if t != nil && t.Kind() == reflect.Struct {
-		ptr := reflect.New(t)
-		if named, ok := ptr.Interface().(NamedMessage); ok {
-			name := named.WireName()
+	if t := reflect.TypeOf(msg); t.Kind() == reflect.Struct {
+		if name, ok := pointerWireName(t); ok {
 			if name == "" {
 				return "", ErrInvalidMessage{Reason: "message wire name must be non-empty"}
 			}
@@ -85,6 +82,28 @@ func WireNameOf(msg Message) (string, error) {
 		}
 	}
 	return defaultWireNameForValue("am", msg)
+}
+
+type pointerWireNameEntry struct {
+	name  string
+	named bool
+}
+
+var pointerWireNames sync.Map // reflect.Type -> pointerWireNameEntry
+
+// pointerWireName returns the wire name of struct type t when only *t
+// implements NamedMessage, as when a message is sent by value.
+func pointerWireName(t reflect.Type) (string, bool) {
+	if cached, ok := pointerWireNames.Load(t); ok {
+		entry := cached.(pointerWireNameEntry)
+		return entry.name, entry.named
+	}
+	var entry pointerWireNameEntry
+	if named, ok := reflect.New(t).Interface().(NamedMessage); ok {
+		entry = pointerWireNameEntry{name: named.WireName(), named: true}
+	}
+	pointerWireNames.Store(t, entry)
+	return entry.name, entry.named
 }
 
 func defaultWireNameForValue(ns string, msg Message) (string, error) {

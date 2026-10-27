@@ -8,9 +8,8 @@ import (
 // benchRecoveryState builds a minimal recoveryState with default negotiated options.
 func benchRecoveryState() *recoveryState {
 	state := &recoveryState{
-		role:        recoveryRoleClient,
-		replay:      newReplayBuffer(protocolVersionV3, 1<<20),
-		resumeQueue: newFrameDeque(),
+		role:   recoveryRoleClient,
+		replay: newReplayBuffer(protocolVersionV3, 1<<20),
 	}
 	state.setNegotiated(defaultServerRecoveryOptions().negotiated())
 	return state
@@ -31,7 +30,7 @@ func BenchmarkNextAckWait_NoPending(b *testing.B) {
 func BenchmarkNextAckWait_WithDelay(b *testing.B) {
 	r := benchRecoveryState()
 	r.mu.Lock()
-	r.ackDueAt = time.Now().Add(10 * time.Millisecond)
+	r.ackDueAt.Store(time.Now().Add(10 * time.Millisecond).UnixNano())
 	r.mu.Unlock()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -57,7 +56,7 @@ func BenchmarkTakePendingControl_AckReady(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		r.mu.Lock()
 		r.lastRecvSeq++
-		r.ackDue = true
+		r.ackDue.Store(true)
 		r.mu.Unlock()
 		_, _, _ = r.takePendingControl()
 	}
@@ -86,7 +85,7 @@ func BenchmarkWaitCalc_AckBeatsHeartbeat(b *testing.B) {
 	r := benchRecoveryState()
 	shortDelay := 5 * time.Millisecond
 	r.mu.Lock()
-	r.ackDueAt = time.Now().Add(shortDelay)
+	r.ackDueAt.Store(time.Now().Add(shortDelay).UnixNano())
 	r.mu.Unlock()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -145,7 +145,7 @@ func TestCompactEnvelopeRoundTrip(t *testing.T) {
 	if wire != "am.test.Compact" {
 		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.Compact")
 	}
-	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
+	raw := rawMessage{Wire: wire, Codec: mustCodec(t, CodecMsgpackCompact), Body: values}
 	decoded, err := decodeRawAs[*codecTestCompact](raw)
 	if err != nil {
 		t.Fatalf("decodeRawAs: %v", err)
@@ -172,7 +172,7 @@ func TestCompactEnvelopeNestedStruct(t *testing.T) {
 		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.CompactNested")
 	}
 
-	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
+	raw := rawMessage{Wire: wire, Codec: mustCodec(t, CodecMsgpackCompact), Body: values}
 	decoded, err := decodeRawAs[*codecTestCompactNested](raw)
 	if err != nil {
 		t.Fatalf("decodeRawAs: %v", err)
@@ -198,12 +198,15 @@ func TestCompactEnvelopeNestedCustomFallback(t *testing.T) {
 	if wire != "am.test.CompactCustom" {
 		t.Fatalf("decodeCompactEnvelope got %q want %q", wire, "am.test.CompactCustom")
 	}
-	if len(values) != 2 {
-		t.Fatalf("expected 2 values, got %d", len(values))
+	if values.count != 2 {
+		t.Fatalf("expected 2 values, got %d", values.count)
 	}
 
 	var nested map[string]any
-	dec := msgpack.NewDecoder(bytes.NewReader(values[1]))
+	dec := msgpack.NewDecoder(bytes.NewReader(values.fields))
+	if err := dec.Skip(); err != nil {
+		t.Fatalf("skip name field: %v", err)
+	}
 	if err := dec.Decode(&nested); err != nil {
 		t.Fatalf("decode nested raw: %v", err)
 	}
@@ -211,7 +214,7 @@ func TestCompactEnvelopeNestedCustomFallback(t *testing.T) {
 		t.Fatalf("unexpected nested value: %#v", nested)
 	}
 
-	raw := rawMessage{Wire: wire, Codec: CodecMsgpackCompact, Body: values}
+	raw := rawMessage{Wire: wire, Codec: mustCodec(t, CodecMsgpackCompact), Body: values}
 	decoded, err := decodeRawAs[*codecTestCompactCustom](raw)
 	if err != nil {
 		t.Fatalf("decodeRawAs: %v", err)
@@ -263,8 +266,8 @@ func TestCompactFieldCountMismatch(t *testing.T) {
 	}
 	raw := rawMessage{
 		Wire:  "am.test.CompactTwo",
-		Codec: CodecMsgpackCompact,
-		Body:  []msgpack.RawMessage{rawField},
+		Codec: mustCodec(t, CodecMsgpackCompact),
+		Body:  compactBody{fields: rawField, count: 1},
 	}
 	_, err = decodeRawAs[*codecTestCompactTwo](raw)
 	var count ErrCompactFieldCount

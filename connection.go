@@ -20,6 +20,9 @@ const (
 	// written, and how long a clean close by the peer waits for the frames
 	// received before it to be delivered.
 	closeFlushTimeout = 5 * time.Second
+	// readBufferSize lets one read from the transport take in several small
+	// frames.
+	readBufferSize = 8 << 10
 )
 
 type connConfig struct {
@@ -27,6 +30,9 @@ type connConfig struct {
 	codecID  CodecID
 	codec    CodecImpl
 	maxFrame uint32
+	// headerLen is the frame header length for version; zero means not
+	// yet computed.
+	headerLen int
 }
 
 // outboundFrame is a frame for the writer. A frame with closing set carries no
@@ -62,10 +68,10 @@ type handlerJob struct {
 // down and any blocking Recv calls return [ErrClosed].
 type Connection struct {
 	conn              net.Conn
-	writer            *bufio.Writer
 	registry          *registry
 	handlersEnabled   bool
 	recvTimeout       time.Duration
+	streamQueueSize   int
 	config            connConfig
 	debug             connectionDebugCounters
 	outbound          chan outboundFrame
@@ -82,7 +88,7 @@ type Connection struct {
 	transportOnce     sync.Once
 	transportMu       sync.Mutex
 	transportCond     *sync.Cond
-	transportGen      uint64
+	transportGen      atomic.Uint64
 	transportResume   uint64
 	recovery          *recoveryState
 	closing           atomic.Bool
@@ -101,7 +107,6 @@ func newPendingConnection(conn net.Conn, registry *registry, onNewStream, onClos
 	}
 	connection := &Connection{
 		conn:            conn,
-		writer:          bufio.NewWriter(conn),
 		registry:        registry,
 		handlersEnabled: registry.hasHandlers(),
 		outbound:        make(chan outboundFrame, streamQueueSize),
@@ -144,17 +149,11 @@ func (c *Connection) start() {
 		go c.recoveryReaderLoop()
 		return
 	}
-	// closeTransport clears c.conn and c.writer while the loops run, so the
-	// loops must not read those fields.
-	go c.writerLoop(c.writer)
+	c.debug.transportAttaches.Add(1)
+	// closeTransport clears c.conn while the loops run, so the loops must not
+	// read it.
+	go c.writerLoop(bufio.NewWriter(c.conn))
 	go c.readerLoop(c.conn)
-}
-
-func (c *Connection) nextOutboundSeq() uint64 {
-	if c == nil || c.config.version != protocolVersionV3 {
-		return 0
-	}
-	return c.nextSendSeq.Add(1)
 }
 
 func (c *Connection) isRecoveryEnabled() bool {
@@ -299,7 +298,7 @@ func (c *Connection) streamForID(streamID uint32) *Stream {
 	if streamCtx := c.getStreamCtx(streamID, false); streamCtx != nil {
 		return streamCtx.stream
 	}
-	return &Stream{id: streamID, connection: c}
+	return closedStream(c)
 }
 
 // NewStream allocates a new stream ID and returns a [Stream] view scoped to
@@ -374,8 +373,8 @@ func (c *Connection) removeStream(streamID uint32) {
 		return
 	}
 	// Promote stream failure to connection so it survives stream removal.
-	if code := streamCtx.stream.debug.lastFailureCode(); code != DebugFailureNone {
-		c.debug.noteFailure(code, streamCtx.stream.debug.lastFailureReason())
+	if failure := streamCtx.stream.debug.lastFailure(); failure.code != DebugFailureNone {
+		c.debug.noteFailure(failure.code, failure.reason)
 	}
 	if streamCtx.stream.close() {
 		c.debug.streamsClosed.Add(1)
@@ -385,12 +384,13 @@ func (c *Connection) removeStream(streamID uint32) {
 	}
 }
 
-// closePeerStream releases a stream that the peer opened. The peer is not told,
-// so the ID stays reserved until the peer's FIN: later frames on it are dropped
-// instead of opening the stream again.
+// closePeerStream releases a stream that the peer opened, or stream 0. The
+// peer is not told, so the ID stays reserved until the peer's FIN: later
+// frames on it are dropped instead of opening the stream again. Stream 0 gets
+// no FIN and stays reserved for the life of the connection.
 func (c *Connection) closePeerStream(streamID uint32) {
 	c.streamsMu.Lock()
-	if _, ok := c.streams[streamID]; ok && streamID != defaultStreamID {
+	if _, ok := c.streams[streamID]; ok {
 		if c.closedPeerStreams == nil {
 			c.closedPeerStreams = make(map[uint32]struct{})
 		}
@@ -439,15 +439,19 @@ func (c *Connection) getStreamCtx(streamID uint32, inbound bool) *StreamContext 
 }
 
 func (c *Connection) newStreamCtx(streamID uint32) *StreamContext {
+	queueSize := c.streamQueueSize
+	if queueSize <= 0 {
+		queueSize = streamQueueSize
+	}
 	var handlerCh chan handlerJob
 	if c.handlersEnabled {
-		handlerCh = make(chan handlerJob, streamQueueSize)
+		handlerCh = make(chan handlerJob, queueSize)
 	}
 	stream := &Stream{
 		id:         streamID,
 		connection: c,
-		inbox:      make(chan rawMessage, streamQueueSize),
-		incoming:   make(chan []byte, streamQueueSize),
+		inbox:      make(chan rawMessage, queueSize),
+		incoming:   make(chan []byte, queueSize),
 		handlerCh:  handlerCh,
 		done:       make(chan struct{}),
 	}
@@ -469,8 +473,7 @@ func (c *Connection) handlerLoop(streamCtx *StreamContext) {
 		c.debug.handlerCalls.Add(1)
 		reply, err := job.handler(streamCtx, job.msg)
 		if err != nil {
-			stream.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
-			c.debug.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
+			stream.noteFailure(DebugFailureHandler, "handler error: "+err.Error())
 			stream.debug.handlerErrors.Add(1)
 			c.debug.handlerErrors.Add(1)
 			_ = stream.sendBoxed(NewErrorReply("handler_error", err.Error()))
@@ -499,7 +502,7 @@ func (c *Connection) decodeLoop(streamCtx *StreamContext) {
 				c.removeStream(stream.id)
 				return
 			}
-			raw, err := newRawMessageFromPayload(c.config.codecID, payload)
+			raw, err := newRawMessageFromPayload(c.config.codec, payload)
 			if err != nil {
 				stream.noteDecodeError(err)
 				stream.protocolError("codec_error", err.Error())
@@ -580,8 +583,9 @@ func (c *Connection) writerLoop(w *bufio.Writer) {
 }
 
 func (c *Connection) readerLoop(conn net.Conn) {
+	r := bufio.NewReaderSize(conn, readBufferSize)
 	for {
-		streamID, _, flags, payload, err := c.readFrameFrom(conn)
+		streamID, _, flags, payload, err := c.readFrameFrom(r)
 		if errors.Is(err, io.EOF) {
 			// The peer closed the transport at a frame boundary.
 			c.closeByPeer()
@@ -647,12 +651,16 @@ func (c *Connection) encodeMessage(msg Message) ([]byte, error) {
 }
 
 func (c *Connection) enqueueFrame(frame outboundFrame) error {
-	if c.closing.Load() {
+	// A connection closed by a failure, rather than by Close, is closed
+	// without closing being set.
+	if c.closing.Load() || c.closed.Load() {
 		return ErrClosed{}
 	}
 	if c.isRecoveryEnabled() {
 		frame.seq = 0
-		frame.queued = make(chan error, 1)
+		if frame.queued == nil {
+			frame.queued = make(chan error, 1)
+		}
 		select {
 		case <-c.closeCh:
 			return ErrClosed{}

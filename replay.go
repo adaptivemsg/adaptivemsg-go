@@ -1,6 +1,7 @@
 package adaptivemsg
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -13,87 +14,60 @@ type frameRecord struct {
 	size     int64
 }
 
-type replayEntry struct {
-	frame *frameRecord
-}
-
 type replayBuffer struct {
-	mu          sync.Mutex
-	version     byte
-	maxBytes    int64
-	usedBytes   int64
-	lastAcked   atomic.Uint64
-	replayQueue []replayEntry
+	mu        sync.Mutex
+	headerLen int
+	maxBytes  int64
+	usedBytes int64
+	lastAcked atomic.Uint64
+	// frames[head:] are the frames kept, in sequence order. An ACK advances
+	// head instead of moving the frames after it.
+	frames []*frameRecord
+	head   int
 }
 
 func newReplayBuffer(version byte, maxBytes int64) *replayBuffer {
+	headerLen, err := frameHeaderLenForVersion(version)
+	if err != nil {
+		headerLen = frameHeaderLenV3
+	}
 	return &replayBuffer{
-		version:  version,
-		maxBytes: maxBytes,
+		headerLen: headerLen,
+		maxBytes:  maxBytes,
 	}
 }
 
-func (b *replayBuffer) add(frame outboundFrame) (*frameRecord, error) {
-	if b == nil || frame.seq == 0 {
-		return &frameRecord{
-			streamID: frame.streamID,
-			seq:      frame.seq,
-			flags:    frame.flags,
-			payload:  frame.payload,
-		}, nil
-	}
-
-	size, err := replayEntrySize(b.version, frame)
-	if err != nil {
-		return nil, err
-	}
-
+// stage keeps frame under sequence number seq unless it has to wait for room.
+// held reports that it waits: it does not fit next to the frames kept now,
+// but will once they are acknowledged.
+func (b *replayBuffer) stage(frame outboundFrame, seq uint64) (record *frameRecord, held bool, err error) {
+	size := int64(b.headerLen + len(frame.payload))
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	lastAcked := b.lastAcked.Load()
-	if frame.seq <= lastAcked {
-		return nil, ErrInvalidMessage{Reason: "replay frame seq already acknowledged"}
+	if b.maxBytes > 0 && b.usedBytes+size > b.maxBytes {
+		if size <= b.maxBytes {
+			return nil, true, nil
+		}
+		return nil, false, ErrFrameTooLarge{Size: len(frame.payload)}
 	}
-	if n := len(b.replayQueue); n > 0 && frame.seq <= b.replayQueue[n-1].frame.seq {
-		return nil, ErrInvalidMessage{Reason: "replay frame seq must increase monotonically"}
+	if seq <= b.lastAcked.Load() {
+		return nil, false, ErrInvalidMessage{Reason: "replay frame seq already acknowledged"}
 	}
-
-	nextUsed := b.usedBytes + size
-	if b.maxBytes > 0 && nextUsed > b.maxBytes {
-		// The writer waits for room first (see fits), so this only rejects a
-		// frame larger than the whole buffer.
-		return nil, ErrFrameTooLarge{Size: len(frame.payload)}
+	if n := len(b.frames); n > b.head && seq <= b.frames[n-1].seq {
+		return nil, false, ErrInvalidMessage{Reason: "replay frame seq must increase monotonically"}
 	}
 
-	record := &frameRecord{
+	record = &frameRecord{
 		streamID: frame.streamID,
-		seq:      frame.seq,
+		seq:      seq,
 		flags:    frame.flags,
 		payload:  frame.payload,
 		size:     size,
 	}
-	b.replayQueue = append(b.replayQueue, replayEntry{
-		frame: record,
-	})
-	b.usedBytes = nextUsed
-	return record, nil
-}
-
-// fits reports whether frame fits next to the frames already kept, and
-// whether it would fit once they are all acknowledged. Errors are left to
-// add.
-func (b *replayBuffer) fits(frame outboundFrame) (now, ever bool) {
-	if b == nil || b.maxBytes <= 0 {
-		return true, true
-	}
-	size, err := replayEntrySize(b.version, frame)
-	if err != nil {
-		return true, true
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.usedBytes+size <= b.maxBytes, size <= b.maxBytes
+	b.frames = append(b.frames, record)
+	b.usedBytes += size
+	return record, false, nil
 }
 
 func (b *replayBuffer) ack(lastSeq uint64) int64 {
@@ -110,19 +84,28 @@ func (b *replayBuffer) ack(lastSeq uint64) int64 {
 	b.lastAcked.Store(lastSeq)
 
 	var dropped int64
-	dropCount := 0
-	for dropCount < len(b.replayQueue) && b.replayQueue[dropCount].frame.seq <= lastSeq {
-		dropped += b.replayQueue[dropCount].frame.size
-		dropCount++
+	for b.head < len(b.frames) && b.frames[b.head].seq <= lastSeq {
+		dropped += b.frames[b.head].size
+		b.frames[b.head] = nil
+		b.head++
 	}
-	if dropCount > 0 {
-		copy(b.replayQueue, b.replayQueue[dropCount:])
-		b.replayQueue = b.replayQueue[:len(b.replayQueue)-dropCount]
-		b.usedBytes -= dropped
+	b.usedBytes -= dropped
+	switch {
+	case b.head == len(b.frames):
+		b.frames = b.frames[:0]
+		b.head = 0
+	case b.head > len(b.frames)/2:
+		// Move the frames kept to the front once they are the smaller part,
+		// so the slice does not grow without bound.
+		n := copy(b.frames, b.frames[b.head:])
+		clear(b.frames[n:])
+		b.frames = b.frames[:n]
+		b.head = 0
 	}
 	return dropped
 }
 
+// snapshotFrom returns the frames after lastSeq.
 func (b *replayBuffer) snapshotFrom(lastSeq uint64) []*frameRecord {
 	if b == nil {
 		return nil
@@ -131,31 +114,15 @@ func (b *replayBuffer) snapshotFrom(lastSeq uint64) []*frameRecord {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	start := 0
-	for start < len(b.replayQueue) && b.replayQueue[start].frame.seq <= lastSeq {
-		start++
-	}
-	if start == len(b.replayQueue) {
+	kept := b.frames[b.head:]
+	start := sort.Search(len(kept), func(i int) bool { return kept[i].seq > lastSeq })
+	if start == len(kept) {
 		return nil
 	}
-
-	frames := make([]*frameRecord, 0, len(b.replayQueue)-start)
-	for _, entry := range b.replayQueue[start:] {
-		frames = append(frames, entry.frame)
-	}
-	return frames
+	return append([]*frameRecord(nil), kept[start:]...)
 }
 
 func (b *replayBuffer) bytesUsed() int64 {
-	if b == nil {
-		return 0
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.usedBytes
-}
-
-func (b *replayBuffer) bytesUsedLocked() int64 {
 	if b == nil {
 		return 0
 	}
@@ -170,7 +137,7 @@ func (b *replayBuffer) count() int {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.replayQueue)
+	return len(b.frames) - b.head
 }
 
 func (b *replayBuffer) lastAckedSeq() uint64 {
@@ -178,12 +145,4 @@ func (b *replayBuffer) lastAckedSeq() uint64 {
 		return 0
 	}
 	return b.lastAcked.Load()
-}
-
-func replayEntrySize(version byte, frame outboundFrame) (int64, error) {
-	headerLen, err := frameHeaderLenForVersion(version)
-	if err != nil {
-		return 0, err
-	}
-	return int64(headerLen + len(frame.payload)), nil
 }

@@ -18,8 +18,8 @@ func (c CodecID) String() string {
 
 // Envelope is an intermediate decode result that preserves the wire name and
 // raw body without fully deserializing the message payload. Wire is the
-// message type name. Body holds codec-specific raw data: for map codec it is
-// a msgpack.RawMessage, for compact codec it is a []msgpack.RawMessage.
+// message type name. Body holds codec-specific raw data, which only the codec
+// that produced it reads back in DecodeInto.
 type Envelope struct {
 	// Wire is the message type name extracted from the payload.
 	Wire string

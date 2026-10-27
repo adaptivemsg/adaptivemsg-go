@@ -39,7 +39,8 @@ type recoveryState struct {
 
 	reconnectActive atomic.Bool
 
-	resumeQueue *frameDeque
+	// resumeDepth is how many frames the writer has left to replay.
+	resumeDepth atomic.Int64
 
 	mu            sync.Mutex
 	shared        negotiatedRecoveryOptions
@@ -50,9 +51,12 @@ type recoveryState struct {
 	lastRecvSeq   uint64
 	lastAckSent   uint64
 	ackPending    uint32
-	ackDue        bool
-	ackDueAt      time.Time
-	expireTimer   *time.Timer
+	// ackDue and ackDueAt change under mu; the writer reads them without it
+	// to skip the lock while no ACK is due. ackDueAt is in Unix nanoseconds,
+	// zero while no ACK is scheduled.
+	ackDue      atomic.Bool
+	ackDueAt    atomic.Int64
+	expireTimer *time.Timer
 }
 
 func newClientRecoveryState(opts ClientRecoveryOptions, negotiated negotiatedRecoveryOptions, addr string, timeout time.Duration, connectionID, resumeSecret recoveryToken) *recoveryState {
@@ -66,7 +70,6 @@ func newClientRecoveryState(opts ClientRecoveryOptions, negotiated negotiatedRec
 		connectionID:        connectionID,
 		resumeSecret:        resumeSecret,
 		replay:              newReplayBuffer(protocolVersionV3, normalized.MaxReplayBytes),
-		resumeQueue:         newFrameDeque(),
 	}
 	state.setNegotiated(negotiated)
 	return state
@@ -81,7 +84,6 @@ func newServerRecoveryState(opts ServerRecoveryOptions, server *Server, connecti
 		connectionID: connectionID,
 		resumeSecret: resumeSecret,
 		replay:       newReplayBuffer(protocolVersionV3, normalized.MaxReplayBytes),
-		resumeQueue:  newFrameDeque(),
 	}
 	state.setNegotiated(normalized.negotiated())
 	return state
@@ -118,8 +120,8 @@ func (c *Connection) waitForTransport(lastGen uint64) (net.Conn, uint64, uint64,
 		if c.closed.Load() {
 			return nil, 0, 0, ErrClosed{}
 		}
-		if c.conn != nil && c.transportGen != lastGen {
-			return c.conn, c.transportGen, c.transportResume, nil
+		if gen := c.transportGen.Load(); c.conn != nil && gen != lastGen {
+			return c.conn, gen, c.transportResume, nil
 		}
 		c.transportCond.Wait()
 	}
@@ -131,26 +133,32 @@ func (c *Connection) attachedTransport(lastGen uint64) (net.Conn, uint64, uint64
 	c.initTransportState()
 	c.transportMu.Lock()
 	defer c.transportMu.Unlock()
-	if c.conn != nil && c.transportGen != lastGen {
-		return c.conn, c.transportGen, c.transportResume, true
+	if gen := c.transportGen.Load(); c.conn != nil && gen != lastGen {
+		return c.conn, gen, c.transportResume, true
 	}
 	return nil, 0, 0, false
 }
 
-func (c *Connection) transportActive(gen uint64, conn net.Conn) bool {
-	c.initTransportState()
-	c.transportMu.Lock()
-	defer c.transportMu.Unlock()
-	return !c.closed.Load() && c.conn == conn && c.transportGen == gen
+// transportActive reports whether the transport attached as generation gen is
+// still the current one. Every attach, detach and close moves to a new
+// generation.
+func (c *Connection) transportActive(gen uint64) bool {
+	return !c.closed.Load() && c.transportGen.Load() == gen
 }
 
 func (c *Connection) attachTransport(conn net.Conn, peerLastRecvSeq uint64) {
 	c.initTransportState()
 	c.transportMu.Lock()
+	// markClosed sets closed before it closes the transport under this lock,
+	// so a transport attached after the check is closed there.
+	if c.closed.Load() {
+		c.transportMu.Unlock()
+		_ = conn.Close()
+		return
+	}
 	oldConn := c.conn
 	c.conn = conn
-	c.writer = bufio.NewWriter(conn)
-	c.transportGen++
+	c.transportGen.Add(1)
 	c.transportResume = peerLastRecvSeq
 	c.transportMu.Unlock()
 	c.debug.transportAttaches.Add(1)
@@ -174,8 +182,7 @@ func (c *Connection) detachTransport(conn net.Conn) bool {
 		return false
 	}
 	c.conn = nil
-	c.writer = nil
-	c.transportGen++
+	c.transportGen.Add(1)
 	c.transportResume = 0
 	c.transportMu.Unlock()
 	c.debug.transportDetaches.Add(1)
@@ -196,8 +203,7 @@ func (c *Connection) closeTransport() {
 	c.transportMu.Lock()
 	conn := c.conn
 	c.conn = nil
-	c.writer = nil
-	c.transportGen++
+	c.transportGen.Add(1)
 	c.transportResume = 0
 	c.transportMu.Unlock()
 	if conn != nil {
@@ -258,19 +264,18 @@ func (r *recoveryState) setNegotiated(opts negotiatedRecoveryOptions) {
 	r.heartbeatTO.Store(int64(normalized.HeartbeatTimeout))
 }
 
-func (r *recoveryState) prepareResume(lastSeq uint64) {
+// prepareResume returns the frames after lastSeq, the last one the peer
+// received, for the writer to replay. That also acknowledges the frames up to
+// lastSeq: the ACK the peer sent for them may have been lost with the old
+// transport.
+func (r *recoveryState) prepareResume(lastSeq uint64) []*frameRecord {
 	if r == nil {
-		return
+		return nil
 	}
+	r.replay.ack(lastSeq)
 	frames := r.replay.snapshotFrom(lastSeq)
-	r.resumeQueue.reset(frames)
-}
-
-func (r *recoveryState) takeResumeFrame() (*frameRecord, bool) {
-	if r == nil {
-		return nil, false
-	}
-	return r.resumeQueue.pop()
+	r.resumeDepth.Store(int64(len(frames)))
+	return frames
 }
 
 func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
@@ -281,7 +286,7 @@ func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
 	r.mu.Lock()
 	if seq <= r.lastRecvSeq {
 		if r.lastAckSent < r.lastRecvSeq {
-			r.ackDue = true
+			r.ackDue.Store(true)
 		}
 		r.mu.Unlock()
 		c.signalSend()
@@ -292,17 +297,17 @@ func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
 	notify := false
 	ackEvery := r.ackEvery.Load()
 	if ackEvery <= 1 || r.ackPending >= ackEvery {
-		r.ackDue = true
-		r.ackDueAt = time.Time{}
+		r.ackDue.Store(true)
+		r.ackDueAt.Store(0)
 		notify = true
 	} else {
 		ackDelay := time.Duration(r.ackDelayNanos.Load())
 		if ackDelay <= 0 {
-			r.ackDue = true
-			r.ackDueAt = time.Time{}
+			r.ackDue.Store(true)
+			r.ackDueAt.Store(0)
 			notify = true
-		} else if r.ackDueAt.IsZero() {
-			r.ackDueAt = time.Now().Add(ackDelay)
+		} else if r.ackDueAt.Load() == 0 {
+			r.ackDueAt.Store(time.Now().Add(ackDelay).UnixNano())
 			notify = true
 		}
 	}
@@ -313,39 +318,43 @@ func (r *recoveryState) noteReceived(c *Connection, seq uint64) {
 }
 
 func (r *recoveryState) nextAckWait() time.Duration {
-	if r == nil {
+	if r == nil || r.ackDue.Load() {
 		return 0
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.ackDue || r.ackDueAt.IsZero() {
+	dueAt := r.ackDueAt.Load()
+	if dueAt == 0 {
 		return 0
 	}
-	wait := time.Until(r.ackDueAt)
-	if wait < 0 {
-		return 0
-	}
-	return wait
+	return max(time.Duration(dueAt-time.Now().UnixNano()), 0)
 }
 
 func (r *recoveryState) takePendingControl() (byte, uint64, bool) {
 	if r == nil {
 		return pendingControlNone, 0, false
 	}
+	if !r.ackDue.Load() {
+		if dueAt := r.ackDueAt.Load(); dueAt == 0 || time.Now().UnixNano() < dueAt {
+			return pendingControlNone, 0, false
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.ackDue && !r.ackDueAt.IsZero() && !time.Now().Before(r.ackDueAt) && r.lastAckSent < r.lastRecvSeq {
-		r.ackDue = true
+	if r.lastAckSent >= r.lastRecvSeq {
+		r.ackDue.Store(false)
+		r.ackDueAt.Store(0)
+		return pendingControlNone, 0, false
 	}
-	if r.ackDue && r.lastAckSent < r.lastRecvSeq {
-		seq := r.lastRecvSeq
-		r.lastAckSent = seq
-		r.ackPending = 0
-		r.ackDue = false
-		r.ackDueAt = time.Time{}
-		return pendingControlAck, seq, true
+	if !r.ackDue.Load() {
+		if dueAt := r.ackDueAt.Load(); dueAt == 0 || time.Now().UnixNano() < dueAt {
+			return pendingControlNone, 0, false
+		}
 	}
-	return pendingControlNone, 0, false
+	seq := r.lastRecvSeq
+	r.lastAckSent = seq
+	r.ackPending = 0
+	r.ackDue.Store(false)
+	r.ackDueAt.Store(0)
+	return pendingControlAck, seq, true
 }
 
 func (r *recoveryState) onDetached(c *Connection) {
@@ -422,15 +431,28 @@ func (r *recoveryState) armReadDeadline(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 }
 
+// testHookReconnected runs after a reconnect attaches a transport, before the
+// reconnect loop ends.
+var testHookReconnected atomic.Pointer[func(*Connection)]
+
 func (c *Connection) reconnectLoop() {
 	if c == nil || c.recovery == nil || c.recovery.role != recoveryRoleClient {
 		return
 	}
-	if !c.recovery.reconnectActive.CompareAndSwap(false, true) {
-		return
+	for c.recovery.reconnectActive.CompareAndSwap(false, true) {
+		c.reconnectUntilAttached()
+		c.recovery.reconnectActive.Store(false)
+		// A detach while the flag was set started no loop of its own.
+		if c.closed.Load() || c.currentTransport() != nil {
+			return
+		}
 	}
-	defer c.recovery.reconnectActive.Store(false)
+}
 
+// reconnectUntilAttached retries the resume, backing off between attempts,
+// until a transport is attached, the resume fails for good, or the connection
+// closes.
+func (c *Connection) reconnectUntilAttached() {
 	backoff := c.recovery.reconnectMinBackoff
 	if backoff <= 0 {
 		backoff = defaultClientRecoveryOptions().ReconnectMinBackoff
@@ -445,10 +467,12 @@ func (c *Connection) reconnectLoop() {
 			return
 		}
 		c.debug.reconnectAttempts.Add(1)
-		conn, err := c.resumeClientTransport()
+		_, err := c.resumeClientTransport()
 		if err == nil {
 			c.debug.reconnectSuccesses.Add(1)
-			_ = conn
+			if hook := testHookReconnected.Load(); hook != nil {
+				(*hook)(c)
+			}
 			return
 		}
 		c.debug.noteFailure(DebugFailureReconnectResume, "resume failed: "+err.Error())
@@ -474,248 +498,245 @@ func (c *Connection) reconnectLoop() {
 	}
 }
 
-func (c *Connection) recoveryWriterLoop() {
-	var lastGen uint64
-	var waitTimer *time.Timer
+var (
+	// errTransportLost ends writing to the current transport; the writer
+	// waits for the next one.
+	errTransportLost = errors.New("recovery transport lost")
+	// errWriterDone ends the writer: the connection is closed.
+	errWriterDone = errors.New("recovery writer done")
+)
+
+// recoveryWriter is the state of the v3 writer goroutine; only that
+// goroutine uses it.
+type recoveryWriter struct {
+	c *Connection
 	// held is a frame that does not fit in the replay buffer yet. While it is
 	// held no other frame is taken, so its sender, and the senders queued
 	// behind it, wait until an ACK frees room.
-	var held *outboundFrame
-	outbound := func() chan outboundFrame {
-		if held != nil {
+	held      *outboundFrame
+	waitTimer *time.Timer
+
+	// The transport being written to.
+	conn        net.Conn
+	bw          *bufio.Writer
+	lastSentSeq uint64
+	// resume holds the frames to replay on this transport.
+	resume []*frameRecord
+}
+
+func (c *Connection) recoveryWriterLoop() {
+	w := &recoveryWriter{c: c, waitTimer: time.NewTimer(time.Hour)}
+	w.waitTimer.Stop()
+	defer w.waitTimer.Stop()
+	var lastGen uint64
+	for {
+		var err error
+		if conn, gen, resumeSeq, ok := c.attachedTransport(lastGen); ok {
+			lastGen = gen
+			err = w.writeTransport(conn, gen, resumeSeq)
+		} else {
+			err = w.stageWhileDetached()
+		}
+		if err == errWriterDone {
+			return
+		}
+	}
+}
+
+// stageWhileDetached waits for a frame while no transport is attached and
+// stages it, so that the resume replays it.
+func (w *recoveryWriter) stageWhileDetached() error {
+	select {
+	case <-w.c.closeCh:
+		return errWriterDone
+	case <-w.c.sendNotify:
+	case frame := <-w.outbound():
+		if frame.closing != nil {
+			close(frame.closing)
+			return errWriterDone
+		}
+		w.stage(frame)
+	}
+	return nil
+}
+
+// writeTransport writes to conn until the transport is lost or the writer is
+// done.
+func (w *recoveryWriter) writeTransport(conn net.Conn, gen, resumeSeq uint64) error {
+	c := w.c
+	w.conn = conn
+	w.bw = bufio.NewWriter(conn)
+	// The peer cannot have received more than was sent.
+	w.lastSentSeq = min(resumeSeq, c.nextSendSeq.Load())
+	w.resume = c.recovery.prepareResume(w.lastSentSeq)
+	for c.transportActive(gen) {
+		wrote, err := w.writeNext()
+		if err == nil && !wrote {
+			err = w.wait()
+		}
+		if err == errTransportLost {
 			return nil
 		}
-		return c.outbound
-	}
-	stageLive := func(frame outboundFrame) (*frameRecord, bool) {
-		if now, ever := c.recovery.replay.fits(frame); !now && ever {
-			held = &frame
-			return nil, false
-		}
-		frame.seq = c.nextOutboundSeq()
-		record, err := c.recovery.replay.add(frame)
 		if err != nil {
-			// Give the unused sequence number back: the peer closes the
-			// connection when a number is skipped. Only this goroutine takes
-			// numbers.
-			c.nextSendSeq.Add(^uint64(0))
-		}
-		if frame.queued != nil {
-			frame.queued <- err
-		}
-		if err != nil {
-			c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live queue failed: "+err.Error())
-			return nil, false
-		}
-		return record, true
-	}
-	stopAndDrain := func() {
-		if !waitTimer.Stop() {
-			select {
-			case <-waitTimer.C:
-			default:
-			}
+			return err
 		}
 	}
-	defer func() {
-		if waitTimer != nil {
-			stopAndDrain()
-		}
-	}()
-	for {
-		conn, gen, resumeSeq, ok := c.attachedTransport(lastGen)
-		if !ok {
-			// Frames sent while no transport is attached are staged, and the
-			// resume replays them.
-			select {
-			case <-c.closeCh:
-				return
-			case <-c.sendNotify:
-			case frame := <-outbound():
-				if frame.closing != nil {
-					close(frame.closing)
-					return
-				}
-				stageLive(frame)
-			}
-			continue
-		}
-		lastGen = gen
-		lastSentSeq := resumeSeq
-		c.recovery.prepareResume(resumeSeq)
-		bw := bufio.NewWriter(conn)
+	return nil
+}
 
-		for {
-			lostTransport := false
-			if !c.transportActive(gen, conn) {
-				break
-			}
-			if _, ackSeq, ok := c.recovery.takePendingControl(); ok {
-				payload := buildAckControlPayload(ackSeq)
-				if err := c.writeFrameNoFlush(bw, controlStreamID, 0, 0, payload); err != nil {
-					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery ack write failed: "+err.Error())
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-				// Batch: also write a pending live frame before flushing
-				select {
-				case frame := <-outbound():
-					if frame.closing != nil {
-						c.finishRecoveryWriter(bw, frame.closing)
-						return
-					}
-					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-						if err := c.writeFrameNoFlush(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
-							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-							c.handleRecoveryTransportError(conn)
-							lostTransport = true
-						}
-						if !lostTransport {
-							lastSentSeq = stored.seq
-						}
-					}
-				default:
-				}
-				if lostTransport {
-					break
-				}
-				if err := bw.Flush(); err != nil {
-					c.debug.noteFailure(DebugFailureRecoveryAckWrite, "recovery flush failed: "+err.Error())
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-				continue
-			}
-			resumeFrame, ok := c.recovery.takeResumeFrame()
-			if ok {
-				if resumeFrame.seq <= lastSentSeq || resumeFrame.seq <= c.recovery.replay.lastAckedSeq() {
-					continue
-				}
-				if err := c.writeFrameTo(bw, resumeFrame.streamID, resumeFrame.seq, resumeFrame.flags, resumeFrame.payload); err != nil {
-					c.debug.noteFailure(DebugFailureRecoveryResumeWrite, "recovery resume write failed: "+err.Error())
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-				lastSentSeq = resumeFrame.seq
-				continue
-			}
-			if held != nil {
-				frame := *held
-				held = nil
-				if stored, ok := stageLive(frame); ok {
-					if stored.seq > lastSentSeq {
-						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
-							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-							c.handleRecoveryTransportError(conn)
-							break
-						}
-						lastSentSeq = stored.seq
-					}
-					continue
-				}
-			}
-			var frame outboundFrame
-			select {
-			case frame = <-outbound():
-			default:
-				frame = outboundFrame{}
-			}
-			if frame.closing != nil {
-				c.finishRecoveryWriter(bw, frame.closing)
-				return
-			}
-			if frame.payload != nil {
-				stored, ok := stageLive(frame)
-				if !ok {
-					continue
-				}
-				if stored.seq <= lastSentSeq {
-					continue
-				}
-				if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
-					c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-				lastSentSeq = stored.seq
-				continue
-			}
-			ackWait := c.recovery.nextAckWait()
-			heartbeatWait := time.Duration(c.recovery.heartbeatIntv.Load())
-			wait := ackWait
-			if heartbeatWait > 0 && (ackWait <= 0 || heartbeatWait < ackWait) {
-				wait = heartbeatWait
-			}
-			if wait <= 0 {
-				select {
-				case <-c.closeCh:
-					return
-				case <-c.sendNotify:
-				case frame := <-outbound():
-					if frame.closing != nil {
-						c.finishRecoveryWriter(bw, frame.closing)
-						return
-					}
-					if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-						if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
-							c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-							c.handleRecoveryTransportError(conn)
-							lostTransport = true
-						}
-						if !lostTransport {
-							lastSentSeq = stored.seq
-						}
-					}
-				}
-				if lostTransport {
-					break
-				}
-				continue
-			}
-			if waitTimer == nil {
-				waitTimer = time.NewTimer(wait)
-			} else {
-				stopAndDrain()
-				waitTimer.Reset(wait)
-			}
-			timerFired := false
-			select {
-			case <-c.closeCh:
-				stopAndDrain()
-				return
-			case <-c.sendNotify:
-				stopAndDrain()
-			case frame := <-outbound():
-				stopAndDrain()
-				if frame.closing != nil {
-					c.finishRecoveryWriter(bw, frame.closing)
-					return
-				}
-				if stored, ok := stageLive(frame); ok && stored.seq > lastSentSeq {
-					if err := c.writeFrameTo(bw, stored.streamID, stored.seq, stored.flags, stored.payload); err != nil {
-						c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live write failed: "+err.Error())
-						c.handleRecoveryTransportError(conn)
-						lostTransport = true
-					}
-					if !lostTransport {
-						lastSentSeq = stored.seq
-					}
-				}
-			case <-waitTimer.C:
-				timerFired = true
-			}
-			if lostTransport {
-				break
-			}
-			if timerFired && wait == heartbeatWait {
-				if err := c.writeFrameTo(bw, controlStreamID, 0, 0, buildPingControlPayload()); err != nil {
-					c.debug.noteFailure(DebugFailureRecoveryPingWrite, "recovery ping write failed: "+err.Error())
-					c.handleRecoveryTransportError(conn)
-					break
-				}
-			}
+// writeNext writes the next frame that is ready: a pending ACK first, then
+// the frames to replay, which go before live frames because live frames take
+// later sequence numbers. It reports whether there may be more to write.
+func (w *recoveryWriter) writeNext() (bool, error) {
+	if _, ackSeq, ok := w.c.recovery.takePendingControl(); ok {
+		return true, w.write(controlStreamID, 0, 0, buildAckControlPayload(ackSeq), "ack", DebugFailureRecoveryAckWrite)
+	}
+	if len(w.resume) > 0 {
+		return true, w.writeResume()
+	}
+	frame, ok := w.takeFrame()
+	if !ok {
+		return false, nil
+	}
+	if frame.closing != nil {
+		w.c.finishRecoveryWriter(w.bw, frame.closing)
+		return false, errWriterDone
+	}
+	if err := w.writeLive(frame); err != nil {
+		return false, err
+	}
+	// A held frame leaves nothing to write until an ACK frees room.
+	return w.held == nil, nil
+}
+
+// wait flushes the frames written so far and waits for something to write:
+// a new frame, a signal that a frame or an ACK is ready, the ACK delay, or
+// the heartbeat interval.
+func (w *recoveryWriter) wait() error {
+	c := w.c
+	if w.bw.Buffered() > 0 {
+		if err := w.bw.Flush(); err != nil {
+			c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery flush failed: "+err.Error())
+			c.handleRecoveryTransportError(w.conn)
+			return errTransportLost
 		}
 	}
+	ackWait := c.recovery.nextAckWait()
+	heartbeatWait := time.Duration(c.recovery.heartbeatIntv.Load())
+	wait := ackWait
+	if heartbeatWait > 0 && (ackWait <= 0 || heartbeatWait < ackWait) {
+		wait = heartbeatWait
+	}
+	var timeout <-chan time.Time
+	if wait > 0 {
+		w.waitTimer.Reset(wait)
+		defer w.waitTimer.Stop()
+		timeout = w.waitTimer.C
+	}
+	select {
+	case <-c.closeCh:
+		return errWriterDone
+	case <-c.sendNotify:
+	case frame := <-w.outbound():
+		if frame.closing != nil {
+			c.finishRecoveryWriter(w.bw, frame.closing)
+			return errWriterDone
+		}
+		return w.writeLive(frame)
+	case <-timeout:
+		if wait == heartbeatWait {
+			return w.write(controlStreamID, 0, 0, buildPingControlPayload(), "ping", DebugFailureRecoveryPingWrite)
+		}
+	}
+	return nil
+}
+
+// outbound returns the queue of new frames, or nil while a frame is held.
+func (w *recoveryWriter) outbound() chan outboundFrame {
+	if w.held != nil {
+		return nil
+	}
+	return w.c.outbound
+}
+
+// takeFrame returns the held frame, or else the next queued frame if there
+// is one.
+func (w *recoveryWriter) takeFrame() (outboundFrame, bool) {
+	if w.held != nil {
+		frame := *w.held
+		w.held = nil
+		return frame, true
+	}
+	select {
+	case frame := <-w.c.outbound:
+		return frame, true
+	default:
+		return outboundFrame{}, false
+	}
+}
+
+// stage keeps a new frame in the replay buffer under the next sequence number
+// and tells its sender the outcome. It returns the kept record, or nil if
+// the frame is held or failed.
+func (w *recoveryWriter) stage(frame outboundFrame) *frameRecord {
+	c := w.c
+	// The number is taken only once the frame is kept: the peer closes the
+	// connection when a number is skipped. Only this goroutine takes numbers.
+	seq := c.nextSendSeq.Load() + 1
+	record, held, err := c.recovery.replay.stage(frame, seq)
+	if held {
+		w.held = &frame
+		return nil
+	}
+	if err == nil {
+		c.nextSendSeq.Store(seq)
+	}
+	if frame.queued != nil {
+		frame.queued <- err
+	}
+	if err != nil {
+		c.debug.noteFailure(DebugFailureRecoveryLiveWrite, "recovery live queue failed: "+err.Error())
+		return nil
+	}
+	return record
+}
+
+// writeLive stages a new frame and writes it, unless the peer has it.
+func (w *recoveryWriter) writeLive(frame outboundFrame) error {
+	record := w.stage(frame)
+	if record == nil || record.seq <= w.lastSentSeq {
+		return nil
+	}
+	if err := w.write(record.streamID, record.seq, record.flags, record.payload, "live", DebugFailureRecoveryLiveWrite); err != nil {
+		return err
+	}
+	w.lastSentSeq = record.seq
+	return nil
+}
+
+// writeResume writes the next frame to replay, unless the peer has it.
+func (w *recoveryWriter) writeResume() error {
+	frame := w.resume[0]
+	w.resume = w.resume[1:]
+	w.c.recovery.resumeDepth.Store(int64(len(w.resume)))
+	if frame.seq <= w.lastSentSeq || frame.seq <= w.c.recovery.replay.lastAckedSeq() {
+		return nil
+	}
+	if err := w.write(frame.streamID, frame.seq, frame.flags, frame.payload, "resume", DebugFailureRecoveryResumeWrite); err != nil {
+		return err
+	}
+	w.lastSentSeq = frame.seq
+	return nil
+}
+
+// write buffers a frame. On failure it detaches the transport.
+func (w *recoveryWriter) write(streamID uint32, seq uint64, flags FrameFlags, payload []byte, kind string, failure DebugFailureCode) error {
+	if err := w.c.writeFrameNoFlush(w.bw, streamID, seq, flags, payload); err != nil {
+		w.c.debug.noteFailure(failure, "recovery "+kind+" write failed: "+err.Error())
+		w.c.handleRecoveryTransportError(w.conn)
+		return errTransportLost
+	}
+	return nil
 }
 
 func (c *Connection) recoveryReaderLoop() {
@@ -726,13 +747,16 @@ func (c *Connection) recoveryReaderLoop() {
 			return
 		}
 		lastGen = gen
+		r := bufio.NewReaderSize(conn, readBufferSize)
+		// Only this goroutine advances the last received sequence number.
+		lastRecvSeq := c.recovery.lastReceived()
 
 		for {
-			if !c.transportActive(gen, conn) {
+			if !c.transportActive(gen) {
 				break
 			}
 			c.recovery.armReadDeadline(conn)
-			streamID, seq, flags, payload, err := c.readFrameFrom(conn)
+			streamID, seq, flags, payload, err := c.readFrameFrom(r)
 			if err != nil {
 				// Resuming would replay the same frame, so a malformed frame is terminal.
 				if isMalformedFrameError(err) {
@@ -749,7 +773,6 @@ func (c *Connection) recoveryReaderLoop() {
 				c.handleRecoveryTransportError(conn)
 				break
 			}
-			c.recovery.armReadDeadline(conn)
 			if streamID == controlStreamID {
 				peerClosed, err := c.handleControlFrame(payload)
 				if err != nil {
@@ -763,7 +786,7 @@ func (c *Connection) recoveryReaderLoop() {
 				}
 				continue
 			}
-			if err := c.handleRecoveryDataFrame(streamID, seq, flags, payload); err != nil {
+			if lastRecvSeq, err = c.handleRecoveryDataFrame(lastRecvSeq, streamID, seq, flags, payload); err != nil {
 				if c.closed.Load() {
 					return
 				}
@@ -807,23 +830,24 @@ func (c *Connection) finishRecoveryWriter(bw *bufio.Writer, done chan struct{}) 
 	close(done)
 }
 
-func (c *Connection) handleRecoveryDataFrame(streamID uint32, seq uint64, flags FrameFlags, payload []byte) error {
+// handleRecoveryDataFrame delivers a data frame that follows lastRecvSeq, the
+// last one received, and returns the new last received sequence number.
+func (c *Connection) handleRecoveryDataFrame(lastRecvSeq uint64, streamID uint32, seq uint64, flags FrameFlags, payload []byte) (uint64, error) {
 	if seq == 0 {
-		return ErrInvalidMessage{Reason: "recovery data frame missing seq"}
+		return lastRecvSeq, ErrInvalidMessage{Reason: "recovery data frame missing seq"}
 	}
-	lastRecvSeq := c.recovery.lastReceived()
 	if seq <= lastRecvSeq {
 		c.recovery.noteReceived(c, seq)
-		return nil
+		return lastRecvSeq, nil
 	}
 	if seq != lastRecvSeq+1 {
-		return ErrInvalidMessage{Reason: "recovery frame sequence gap"}
+		return lastRecvSeq, ErrInvalidMessage{Reason: "recovery frame sequence gap"}
 	}
 	if err := c.acceptFrame(streamID, flags, payload); err != nil {
-		return err
+		return lastRecvSeq, err
 	}
 	c.recovery.noteReceived(c, seq)
-	return nil
+	return seq, nil
 }
 
 func (c *Connection) handleRecoveryTransportError(conn net.Conn) {

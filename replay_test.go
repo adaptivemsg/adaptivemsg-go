@@ -5,27 +5,26 @@ import (
 	"testing"
 )
 
-func TestReplayBufferAddTracksBytesAndSnapshot(t *testing.T) {
+func mustStage(t *testing.T, buffer *replayBuffer, streamID uint32, seq uint64, payload string) *frameRecord {
+	t.Helper()
+	record, held, err := buffer.stage(outboundFrame{streamID: streamID, payload: []byte(payload)}, seq)
+	if err != nil || held {
+		t.Fatalf("stage seq %d: held=%v err=%v", seq, held, err)
+	}
+	return record
+}
+
+func replayFrameSize(payload string) int64 {
+	return int64(frameHeaderLenV3 + len(payload))
+}
+
+func TestReplayBufferStageTracksBytesAndSnapshot(t *testing.T) {
 	buffer := newReplayBuffer(protocolVersionV3, 1024)
-	frame := outboundFrame{
-		streamID: 7,
-		seq:      1,
-		payload:  []byte("hello"),
-	}
+	stored := mustStage(t, buffer, 7, 1, "hello")
 
-	stored, err := buffer.add(frame)
-	if err != nil {
-		t.Fatalf("add: %v", err)
+	if got, want := buffer.bytesUsed(), replayFrameSize("hello"); got != want {
+		t.Fatalf("bytesUsed got %d want %d", got, want)
 	}
-
-	size, err := replayEntrySize(protocolVersionV3, frame)
-	if err != nil {
-		t.Fatalf("replayEntrySize: %v", err)
-	}
-	if got := buffer.bytesUsed(); got != size {
-		t.Fatalf("bytesUsed got %d want %d", got, size)
-	}
-
 	if got := string(stored.payload); got != "hello" {
 		t.Fatalf("stored payload got %q want %q", got, "hello")
 	}
@@ -40,57 +39,35 @@ func TestReplayBufferAddTracksBytesAndSnapshot(t *testing.T) {
 
 func TestReplayBufferAckDropsCumulativePrefix(t *testing.T) {
 	buffer := newReplayBuffer(protocolVersionV3, 1024)
-	frames := []outboundFrame{
-		{streamID: 1, seq: 1, payload: []byte("one")},
-		{streamID: 2, seq: 2, payload: []byte("two")},
-		{streamID: 1, seq: 3, payload: []byte("three")},
-	}
-
-	var expectedRemaining int64
-	for i, frame := range frames {
-		if _, err := buffer.add(frame); err != nil {
-			t.Fatalf("add frame %d: %v", i, err)
-		}
-		if i >= 2 {
-			size, err := replayEntrySize(protocolVersionV3, frame)
-			if err != nil {
-				t.Fatalf("replayEntrySize: %v", err)
-			}
-			expectedRemaining += size
-		}
-	}
+	mustStage(t, buffer, 1, 1, "one")
+	mustStage(t, buffer, 2, 2, "two")
+	mustStage(t, buffer, 1, 3, "three")
 
 	dropped := buffer.ack(2)
-	if dropped == 0 {
-		t.Fatalf("ack dropped 0 bytes, want > 0")
+	if want := replayFrameSize("one") + replayFrameSize("two"); dropped != want {
+		t.Fatalf("ack dropped %d bytes, want %d", dropped, want)
 	}
 	if got := buffer.lastAckedSeq(); got != 2 {
 		t.Fatalf("lastAckedSeq got %d want 2", got)
 	}
-	if got := buffer.bytesUsed(); got != expectedRemaining {
-		t.Fatalf("bytesUsed after ack got %d want %d", got, expectedRemaining)
+	if got, want := buffer.bytesUsed(), replayFrameSize("three"); got != want {
+		t.Fatalf("bytesUsed after ack got %d want %d", got, want)
 	}
 
 	remaining := buffer.snapshotFrom(0)
-	if len(remaining) != 1 {
-		t.Fatalf("remaining frames got %d want 1", len(remaining))
+	if len(remaining) != 1 || remaining[0].seq != 3 {
+		t.Fatalf("remaining frames got %v, want just seq 3", remaining)
 	}
-	if remaining[0].seq != 3 {
-		t.Fatalf("remaining seq got %d want 3", remaining[0].seq)
+	if got := buffer.count(); got != 1 {
+		t.Fatalf("count got %d want 1", got)
 	}
 }
 
 func TestReplayBufferSnapshotFromSeq(t *testing.T) {
 	buffer := newReplayBuffer(protocolVersionV3, 1024)
-	for _, frame := range []outboundFrame{
-		{streamID: 1, seq: 10, payload: []byte("a")},
-		{streamID: 1, seq: 11, payload: []byte("b")},
-		{streamID: 2, seq: 12, payload: []byte("c")},
-	} {
-		if _, err := buffer.add(frame); err != nil {
-			t.Fatalf("add: %v", err)
-		}
-	}
+	mustStage(t, buffer, 1, 10, "a")
+	mustStage(t, buffer, 1, 11, "b")
+	mustStage(t, buffer, 2, 12, "c")
 
 	frames := buffer.snapshotFrom(10)
 	if len(frames) != 2 {
@@ -99,52 +76,70 @@ func TestReplayBufferSnapshotFromSeq(t *testing.T) {
 	if frames[0].seq != 11 || frames[1].seq != 12 {
 		t.Fatalf("snapshot seqs got %d,%d want 11,12", frames[0].seq, frames[1].seq)
 	}
+	if frames := buffer.snapshotFrom(12); frames != nil {
+		t.Fatalf("snapshot after the last frame got %v, want none", frames)
+	}
 }
 
 func TestReplayBufferRejectsFrameLargerThanBuffer(t *testing.T) {
-	frame := outboundFrame{
-		streamID: 1,
-		seq:      1,
-		payload:  []byte("payload"),
+	const payload = "payload"
+	buffer := newReplayBuffer(protocolVersionV3, replayFrameSize(payload)-1)
+	_, held, err := buffer.stage(outboundFrame{streamID: 1, payload: []byte(payload)}, 1)
+	if held {
+		t.Fatal("a frame larger than the whole buffer was held")
 	}
-	size, err := replayEntrySize(protocolVersionV3, frame)
-	if err != nil {
-		t.Fatalf("replayEntrySize: %v", err)
-	}
-
-	buffer := newReplayBuffer(protocolVersionV3, size-1)
-	if now, ever := buffer.fits(frame); now || ever {
-		t.Fatalf("fits got now=%v ever=%v, want false, false", now, ever)
-	}
-	_, err = buffer.add(frame)
-
 	var tooLarge ErrFrameTooLarge
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
 	}
-	if tooLarge.Size != len(frame.payload) {
-		t.Fatalf("size got %d want %d", tooLarge.Size, len(frame.payload))
+	if tooLarge.Size != len(payload) {
+		t.Fatalf("size got %d want %d", tooLarge.Size, len(payload))
 	}
 }
 
-func TestReplayBufferFitsAfterAck(t *testing.T) {
-	first := outboundFrame{streamID: 1, seq: 1, payload: []byte("payload")}
-	size, err := replayEntrySize(protocolVersionV3, first)
-	if err != nil {
-		t.Fatalf("replayEntrySize: %v", err)
-	}
-	buffer := newReplayBuffer(protocolVersionV3, size)
-	if _, err := buffer.add(first); err != nil {
-		t.Fatalf("add: %v", err)
-	}
+func TestReplayBufferHoldsFrameUntilAck(t *testing.T) {
+	const payload = "payload"
+	buffer := newReplayBuffer(protocolVersionV3, replayFrameSize(payload))
+	mustStage(t, buffer, 1, 1, payload)
 
-	second := first
-	second.seq = 2
-	if now, ever := buffer.fits(second); now || !ever {
-		t.Fatalf("fits got now=%v ever=%v, want false, true", now, ever)
+	second := outboundFrame{streamID: 1, payload: []byte(payload)}
+	if record, held, err := buffer.stage(second, 2); record != nil || !held || err != nil {
+		t.Fatalf("stage got record=%v held=%v err=%v, want held", record, held, err)
 	}
 	buffer.ack(1)
-	if now, _ := buffer.fits(second); !now {
-		t.Fatal("fits after the ACK got now=false, want true")
+	if _, held, err := buffer.stage(second, 2); held || err != nil {
+		t.Fatalf("stage after the ACK got held=%v err=%v", held, err)
+	}
+}
+
+func TestReplayBufferRejectsStaleSeq(t *testing.T) {
+	buffer := newReplayBuffer(protocolVersionV3, 1024)
+	mustStage(t, buffer, 1, 5, "a")
+	if _, _, err := buffer.stage(outboundFrame{payload: []byte("b")}, 5); err == nil {
+		t.Fatal("a repeated sequence number was accepted")
+	}
+	buffer.ack(5)
+	if _, _, err := buffer.stage(outboundFrame{payload: []byte("c")}, 4); err == nil {
+		t.Fatal("an acknowledged sequence number was accepted")
+	}
+}
+
+// Acknowledging frames one at a time must not move the frames after them each
+// time, and must keep the rest in order.
+func TestReplayBufferManyAcks(t *testing.T) {
+	buffer := newReplayBuffer(protocolVersionV3, 0)
+	const n = 1000
+	for seq := uint64(1); seq <= n; seq++ {
+		mustStage(t, buffer, 1, seq, "x")
+	}
+	for seq := uint64(1); seq <= n/2; seq++ {
+		buffer.ack(seq)
+	}
+	frames := buffer.snapshotFrom(0)
+	if len(frames) != n/2 || frames[0].seq != n/2+1 || frames[len(frames)-1].seq != n {
+		t.Fatalf("after %d ACKs kept %d frames from %d", n/2, len(frames), frames[0].seq)
+	}
+	if got, want := buffer.bytesUsed(), int64(n/2)*replayFrameSize("x"); got != want {
+		t.Fatalf("bytesUsed got %d want %d", got, want)
 	}
 }

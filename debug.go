@@ -55,17 +55,26 @@ const (
 	DebugFailureRecoveryData DebugFailureCode = "recovery.data"
 )
 
+// cacheLinePad keeps counters updated by different goroutines off each
+// other's cache lines.
+const cacheLinePad = 64
+
 type connectionDebugCounters struct {
+	// Counted by the goroutine that writes frames.
+	framesWritten        atomic.Uint64
+	bytesWritten         atomic.Uint64
+	controlFramesWritten atomic.Uint64
+	_                    [cacheLinePad]byte
+	// Counted by the goroutine that reads frames.
+	framesRead        atomic.Uint64
+	bytesRead         atomic.Uint64
+	controlFramesRead atomic.Uint64
+	_                 [cacheLinePad]byte
+
 	streamsOpened                 atomic.Uint64
 	streamsClosed                 atomic.Uint64
 	dataMessagesSent              atomic.Uint64
 	dataMessagesReceived          atomic.Uint64
-	framesWritten                 atomic.Uint64
-	framesRead                    atomic.Uint64
-	bytesWritten                  atomic.Uint64
-	bytesRead                     atomic.Uint64
-	controlFramesWritten          atomic.Uint64
-	controlFramesRead             atomic.Uint64
 	protocolErrors                atomic.Uint64
 	protocolErrorReplySendFailure atomic.Uint64
 	remoteErrors                  atomic.Uint64
@@ -77,9 +86,7 @@ type connectionDebugCounters struct {
 	reconnectFailures             atomic.Uint64
 	transportAttaches             atomic.Uint64
 	transportDetaches             atomic.Uint64
-	lastFailureCodeValue          atomic.Value
-	lastFailure                   atomic.Value
-	lastFailureUnixNanos          atomic.Int64
+	failureTracker
 }
 
 type streamDebugCounters struct {
@@ -91,9 +98,43 @@ type streamDebugCounters struct {
 	decodeErrors                  atomic.Uint64
 	handlerCalls                  atomic.Uint64
 	handlerErrors                 atomic.Uint64
-	lastFailureCodeValue          atomic.Value
-	lastFailure                   atomic.Value
-	lastFailureUnixNanos          atomic.Int64
+	failureTracker
+}
+
+// failureRecord is the last failure noted on a connection or stream.
+type failureRecord struct {
+	code   DebugFailureCode
+	reason string
+	at     time.Time
+}
+
+// failureTracker keeps the last failure. Its code, reason and time are
+// replaced together, so a snapshot never mixes two failures.
+type failureTracker struct {
+	last atomic.Pointer[failureRecord]
+}
+
+func (f *failureTracker) noteFailure(code DebugFailureCode, reason string) {
+	if f == nil || (code == DebugFailureNone && reason == "") {
+		return
+	}
+	if code == DebugFailureNone {
+		if prev := f.last.Load(); prev != nil {
+			code = prev.code
+		}
+	}
+	f.last.Store(&failureRecord{code: code, reason: reason, at: time.Now()})
+}
+
+// lastFailure returns the last failure, or the zero record if none was noted.
+func (f *failureTracker) lastFailure() failureRecord {
+	if f == nil {
+		return failureRecord{}
+	}
+	if last := f.last.Load(); last != nil {
+		return *last
+	}
+	return failureRecord{}
 }
 
 // ConnectionCounters holds point-in-time counters for a connection.
@@ -203,7 +244,8 @@ type RecoveryDebugState struct {
 	ReconnectActive bool
 	// LastRecvSeq is the sequence number of the last received data frame.
 	LastRecvSeq uint64
-	// LastAckedSeq is the sequence number of the last acknowledged data frame.
+	// LastAckedSeq is the highest sequence number of ours that the peer has
+	// acknowledged.
 	LastAckedSeq uint64
 	// AckPending is the number of received frames not yet acknowledged.
 	AckPending uint32
@@ -276,11 +318,12 @@ func (c *Connection) DebugState() ConnectionDebugState {
 	streamCount := len(c.streams)
 	c.streamsMu.Unlock()
 
+	failure := c.debug.lastFailure()
 	state := ConnectionDebugState{
 		Closed:          c.closed.Load(),
-		LastFailureCode: c.debug.lastFailureCode(),
-		LastFailure:     c.debug.lastFailureReason(),
-		LastFailureAt:   c.debug.lastFailureTime(),
+		LastFailureCode: failure.code,
+		LastFailure:     failure.reason,
+		LastFailureAt:   failure.at,
 		Protocol:        c.config.version,
 		CodecID:         c.config.codecID,
 		CodecName:       c.config.codecID.String(),
@@ -359,12 +402,13 @@ func (s *Stream) debugState() StreamDebugState {
 	if s.handlerCh != nil {
 		handlerDepth = len(s.handlerCh)
 	}
+	failure := s.debug.lastFailure()
 	return StreamDebugState{
 		ID:              s.id,
 		Closed:          s.closed.Load(),
-		LastFailureCode: s.debug.lastFailureCode(),
-		LastFailure:     s.debug.lastFailureReason(),
-		LastFailureAt:   s.debug.lastFailureTime(),
+		LastFailureCode: failure.code,
+		LastFailure:     failure.reason,
+		LastFailureAt:   failure.at,
 		RecvTimeout:     time.Duration(s.recvTimeoutNanos.Load()),
 		InboxDepth:      len(s.inbox),
 		IncomingDepth:   len(s.incoming),
@@ -379,12 +423,14 @@ func (r *recoveryState) debugState(c *Connection) RecoveryDebugState {
 	}
 	transportAttached := false
 	transportGen := uint64(0)
+	liveQueueDepth := 0
 	if c != nil {
 		c.initTransportState()
 		c.transportMu.Lock()
 		transportAttached = c.conn != nil
-		transportGen = c.transportGen
+		transportGen = c.transportGen.Load()
 		c.transportMu.Unlock()
+		liveQueueDepth = len(c.outbound)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -397,108 +443,16 @@ func (r *recoveryState) debugState(c *Connection) RecoveryDebugState {
 		LastRecvSeq:       r.lastRecvSeq,
 		LastAckedSeq:      r.replay.lastAckedSeq(),
 		AckPending:        r.ackPending,
-		AckDue:            r.ackDue,
+		AckDue:            r.ackDue.Load(),
 		AckEvery:          r.ackEvery.Load(),
 		AckDelay:          time.Duration(r.ackDelayNanos.Load()),
 		HeartbeatInterval: time.Duration(r.heartbeatIntv.Load()),
 		HeartbeatTimeout:  time.Duration(r.heartbeatTO.Load()),
 		ReplayQueued:      r.replay.count(),
-		ReplayBytes:       r.replay.bytesUsedLocked(),
-		LiveQueueDepth:    0,
-		ResumeQueueDepth:  r.resumeQueue.len(),
+		ReplayBytes:       r.replay.bytesUsed(),
+		LiveQueueDepth:    liveQueueDepth,
+		ResumeQueueDepth:  int(r.resumeDepth.Load()),
 	}
-}
-
-func (d *connectionDebugCounters) noteFailure(code DebugFailureCode, reason string) {
-	if d == nil || (code == DebugFailureNone && reason == "") {
-		return
-	}
-	if code != DebugFailureNone {
-		d.lastFailureCodeValue.Store(string(code))
-	}
-	d.lastFailure.Store(reason)
-	d.lastFailureUnixNanos.Store(time.Now().UnixNano())
-}
-
-func (d *connectionDebugCounters) lastFailureCode() DebugFailureCode {
-	if d == nil {
-		return DebugFailureNone
-	}
-	v := d.lastFailureCodeValue.Load()
-	if v == nil {
-		return DebugFailureNone
-	}
-	code, _ := v.(string)
-	return DebugFailureCode(code)
-}
-
-func (d *connectionDebugCounters) lastFailureReason() string {
-	if d == nil {
-		return ""
-	}
-	v := d.lastFailure.Load()
-	if v == nil {
-		return ""
-	}
-	reason, _ := v.(string)
-	return reason
-}
-
-func (d *connectionDebugCounters) lastFailureTime() time.Time {
-	if d == nil {
-		return time.Time{}
-	}
-	ns := d.lastFailureUnixNanos.Load()
-	if ns <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns)
-}
-
-func (d *streamDebugCounters) noteFailure(code DebugFailureCode, reason string) {
-	if d == nil || (code == DebugFailureNone && reason == "") {
-		return
-	}
-	if code != DebugFailureNone {
-		d.lastFailureCodeValue.Store(string(code))
-	}
-	d.lastFailure.Store(reason)
-	d.lastFailureUnixNanos.Store(time.Now().UnixNano())
-}
-
-func (d *streamDebugCounters) lastFailureCode() DebugFailureCode {
-	if d == nil {
-		return DebugFailureNone
-	}
-	v := d.lastFailureCodeValue.Load()
-	if v == nil {
-		return DebugFailureNone
-	}
-	code, _ := v.(string)
-	return DebugFailureCode(code)
-}
-
-func (d *streamDebugCounters) lastFailureReason() string {
-	if d == nil {
-		return ""
-	}
-	v := d.lastFailure.Load()
-	if v == nil {
-		return ""
-	}
-	reason, _ := v.(string)
-	return reason
-}
-
-func (d *streamDebugCounters) lastFailureTime() time.Time {
-	if d == nil {
-		return time.Time{}
-	}
-	ns := d.lastFailureUnixNanos.Load()
-	if ns <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns)
 }
 
 func (r recoveryRole) String() string {

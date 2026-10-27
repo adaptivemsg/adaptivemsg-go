@@ -31,12 +31,18 @@ type Stream struct {
 	done             chan struct{}
 	recvTimeoutNanos atomic.Int64
 	recvActive       atomic.Bool
-	peeked           rawMessage
-	hasPeeked        bool
-	staleReplies     int
-	closed           atomic.Bool
-	closeOnce        sync.Once
-	sendMu           sync.Mutex
+	// peeked, hasPeeked, staleReplies and recvTimer belong to the holder of
+	// the recv guard.
+	peeked       rawMessage
+	hasPeeked    bool
+	staleReplies int
+	recvTimer    *time.Timer
+	closed       atomic.Bool
+	closeOnce    sync.Once
+	sendMu       sync.Mutex
+	// queued carries the recovery writer's verdict on each frame sent. Sends
+	// hold sendMu, so they use it one at a time.
+	queued chan error
 }
 
 // ID returns the numeric stream identifier assigned by the connection.
@@ -52,6 +58,10 @@ func (s *Stream) ID() uint32 {
 // stream 0, whose lifetime follows the connection; frames the peer still sends
 // on such a stream are dropped. After Close returns, subsequent Send and Recv
 // calls on this stream return [ErrClosed]. Close is idempotent.
+//
+// Like [Stream.Send], Close waits while the connection's send queue is full
+// and, with recovery, while MaxReplayBytes of messages await acknowledgement.
+// It returns once the FIN is queued or the connection has closed.
 func (s *Stream) Close() {
 	if s == nil || s.connection == nil {
 		return
@@ -66,12 +76,10 @@ func (s *Stream) Close() {
 		return
 	}
 	s.closed.Store(true)
-	// The payload must be non-nil: the recovery writer treats a nil payload
-	// as "no frame".
 	err := s.connection.enqueueFrame(outboundFrame{
 		streamID: s.id,
 		flags:    FrameFlagFIN,
-		payload:  []byte{},
+		queued:   s.queuedChan(),
 	})
 	s.sendMu.Unlock()
 	s.connection.removeStream(s.id)
@@ -223,7 +231,6 @@ func (s *Stream) takeRaw() (rawMessage, error) {
 	if s.hasPeeked {
 		msg := s.peeked
 		s.hasPeeked = false
-		s.noteReceivedMessage()
 		return msg, nil
 	}
 	return s.readRaw()
@@ -255,12 +262,17 @@ func (s *Stream) peekRaw() (rawMessage, error) {
 	return msg, nil
 }
 
+// readRaw returns the next message. The caller holds the recv guard.
 func (s *Stream) readRaw() (rawMessage, error) {
 	var timeout <-chan time.Time
 	if nanos := s.recvTimeoutNanos.Load(); nanos > 0 {
-		timer := time.NewTimer(time.Duration(nanos))
-		defer timer.Stop()
-		timeout = timer.C
+		if s.recvTimer == nil {
+			s.recvTimer = time.NewTimer(time.Duration(nanos))
+		} else {
+			s.recvTimer.Reset(time.Duration(nanos))
+		}
+		defer s.recvTimer.Stop()
+		timeout = s.recvTimer.C
 	}
 	for {
 		var msg rawMessage
@@ -285,7 +297,6 @@ func (s *Stream) readRaw() (rawMessage, error) {
 			s.staleReplies--
 			continue
 		}
-		s.noteReceivedMessage()
 		return msg, nil
 	}
 }
@@ -301,14 +312,12 @@ func (s *Stream) sendBoxed(msg Message) error {
 		err = ErrFrameTooLarge{Size: len(payload)}
 	}
 	if err != nil {
-		s.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
-		s.connection.debug.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
+		s.noteFailure(DebugFailureStreamEncode, "encode failed: "+err.Error())
 		return err
 	}
-	frame := outboundFrame{streamID: s.id, payload: payload}
+	frame := outboundFrame{streamID: s.id, payload: payload, queued: s.queuedChan()}
 	if err := s.connection.enqueueFrame(frame); err != nil {
-		s.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
-		s.connection.debug.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
+		s.noteFailure(DebugFailureStreamEnqueue, "enqueue failed: "+err.Error())
 		return err
 	}
 	s.debug.dataMessagesSent.Add(1)
@@ -316,9 +325,23 @@ func (s *Stream) sendBoxed(msg Message) error {
 	return nil
 }
 
+// queuedChan returns the channel for the recovery writer's verdict, or nil
+// without recovery. The caller holds sendMu. A verdict can only be left
+// unread when the connection closes, after which no frame is sent.
+func (s *Stream) queuedChan() chan error {
+	if !s.connection.isRecoveryEnabled() {
+		return nil
+	}
+	if s.queued == nil {
+		s.queued = make(chan error, 1)
+	}
+	return s.queued
+}
+
 func (s *Stream) inboxQ(msg rawMessage) error {
 	select {
 	case s.inbox <- msg:
+		s.noteReceivedMessage()
 		return nil
 	case <-s.done:
 		return ErrClosed{}
@@ -353,6 +376,7 @@ func (s *Stream) handlerQ(job handlerJob) error {
 	}
 	select {
 	case s.handlerCh <- job:
+		s.noteReceivedMessage()
 		return nil
 	case <-s.done:
 		return ErrClosed{}
@@ -387,8 +411,7 @@ func (s *Stream) protocolError(code, message string) {
 	s.debug.protocolErrors.Add(1)
 	s.connection.debug.protocolErrors.Add(1)
 	if err := s.sendBoxed(NewErrorReply(code, message)); err != nil {
-		s.debug.noteFailure(DebugFailureStreamProtocolReplySend, "protocol error reply send failed: "+err.Error())
-		s.connection.debug.noteFailure(DebugFailureStreamProtocolReplySend, "protocol error reply send failed: "+err.Error())
+		s.noteFailure(DebugFailureStreamProtocolReplySend, "protocol error reply send failed: "+err.Error())
 		s.debug.protocolErrorReplySendFailure.Add(1)
 		s.connection.debug.protocolErrorReplySendFailure.Add(1)
 	}
@@ -425,13 +448,18 @@ func isInterfaceType[T any]() bool {
 
 var errorReplyWireName = expectedWireName[*ErrorReply]()
 
+// noteFailure notes a failure on the stream and on its connection.
+func (s *Stream) noteFailure(code DebugFailureCode, reason string) {
+	s.debug.noteFailure(code, reason)
+	s.connection.debug.noteFailure(code, reason)
+}
+
 func (s *Stream) noteDecodeError(err error) {
 	reason := "decode failed"
 	if err != nil {
 		reason = "decode failed: " + err.Error()
 	}
-	s.debug.noteFailure(DebugFailureStreamDecode, reason)
-	s.connection.debug.noteFailure(DebugFailureStreamDecode, reason)
+	s.noteFailure(DebugFailureStreamDecode, reason)
 	s.debug.decodeErrors.Add(1)
 	s.connection.debug.decodeErrors.Add(1)
 }
@@ -441,6 +469,8 @@ func (s *Stream) noteRemoteError() {
 	s.connection.debug.remoteErrors.Add(1)
 }
 
+// noteReceivedMessage counts a message delivered to the stream, for Recv or
+// for a handler.
 func (s *Stream) noteReceivedMessage() {
 	s.debug.dataMessagesReceived.Add(1)
 	s.connection.debug.dataMessagesReceived.Add(1)

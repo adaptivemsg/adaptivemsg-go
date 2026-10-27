@@ -144,12 +144,12 @@ Functions:
 
 Client:
 - `NewClient`
-- `Client.WithConnectTimeout`, `Client.WithRecvTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithRecovery`, `Client.Connect`, `Client.ConnectOnce`
+- `Client.WithConnectTimeout`, `Client.WithRecvTimeout`, `Client.WithCodecs`, `Client.WithMaxFrame`, `Client.WithStreamQueueSize`, `Client.WithRecovery`, `Client.Connect`, `Client.ConnectOnce`
 - `OnceConn.SendRecv[T]`
 
 Server:
 - `NewServer`
-- `Server.WithCodecs`, `Server.WithMaxFrame`, `Server.WithRecovery`, `Server.Serve`, `Server.OnConnect`, `Server.OnDisconnect`, `Server.OnNewStream`, `Server.OnCloseStream`
+- `Server.WithCodecs`, `Server.WithMaxFrame`, `Server.WithHandshakeTimeout`, `Server.WithStreamQueueSize`, `Server.WithRecovery`, `Server.Serve`, `Server.Shutdown`, `Server.OnConnect`, `Server.OnDisconnect`, `Server.OnNewStream`, `Server.OnCloseStream`
 - `Netconn.PeerAddr`
 
 Connection (default stream view):
@@ -181,7 +181,7 @@ Protocol/compat errors:
   `ErrBadHandshakeMagic`, `ErrFrameTooLarge`, `ErrUnsupportedTransport`, `ErrResumeRejected`.
 
 Runtime errors:
-- `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`.
+- `ErrClosed`, `ErrRecvTimeout`, `ErrConcurrentRecv`, `ErrHandlerTaskBusy`, `ErrConnectTimeout`, `ErrServerClosed`.
 
 Remote errors:
 - `ErrorReply` is sent by the peer; `SendRecv` surfaces it as `ErrRemote{Code, Message}`.
@@ -199,6 +199,9 @@ Notes:
 - `Connection.Close()` delivers the messages already queued by `Send`: it writes them, tells the peer, and waits for the peer to close its side, at most 5 seconds. With recovery, the server then releases the connection at once instead of keeping it for `DetachedTTL`.
 - Frames are limited to 16 MiB by default; the limit is the smaller of `Client.WithMaxFrame` and `Server.WithMaxFrame`. `Send` returns `ErrFrameTooLarge` for a larger message and the connection stays usable. With recovery, messages awaiting acknowledgement are kept in a replay buffer of `MaxReplayBytes` (32 MiB by default, twice the max frame); raise both together.
 - `Client.WithConnectTimeout` sets how long establishing a connection may take: failed dials are retried until then, and with recovery it also limits each reconnect attempt. Without it the client dials once. `Client.WithRecvTimeout` sets the initial recv timeout of every stream; `SetRecvTimeout` changes it for one stream.
+- The server closes an accepted connection that has not completed the handshake (and, with recovery, the attach) within 2 minutes. `Server.WithHandshakeTimeout` changes the limit; `0` disables it.
+- `Server.Shutdown(ctx)` stops the server: `Serve` returns `ErrServerClosed`, connections still in the handshake are dropped, and established connections close as `Connection.Close` closes them, after which their `OnDisconnect` runs. A failed accept, such as `EMFILE` when the process is out of file descriptors, does not end `Serve`; it waits briefly and accepts again.
+- Each stream buffers up to 1024 received messages (`WithStreamQueueSize` on the client or server changes it). When a stream's buffer is full the connection stops reading, which holds up its other streams too, so a smaller buffer saves memory but stalls sooner.
 - Register handler/message types with `MustRegister` before `NewClient()`/`NewServer()` so the snapshot sees them.
 - Use `PeekWire()` on a stream (or `conn.PeekWire()`) to inspect the next message type before decoding; it honors the same recv timeout and concurrency rules as `Recv`.
 - Message names default to `am.<package-leaf>.<TypeName>`; implement `WireName() string` on a type if you need an override.

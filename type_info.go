@@ -40,17 +40,3 @@ func messageTypeInfo(t reflect.Type) *typeInfo {
 	typeInfoCache.Store(t, info)
 	return info
 }
-
-func requireRegisteredForReflectType(r *registry, t reflect.Type) error {
-	if r == nil {
-		return ErrInvalidMessage{Reason: "registry must be non-nil"}
-	}
-	info := messageTypeInfo(t)
-	if info.err != nil {
-		return info.err
-	}
-	if _, ok := r.message(info.wire); ok {
-		return nil
-	}
-	return ErrUnknownMessage{Name: info.wire}
-}

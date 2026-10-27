@@ -24,12 +24,13 @@ import (
 // Defaults: codecs [CodecMsgpackCompact, CodecMsgpackMap], max frame 16 MiB,
 // no timeouts, recovery disabled.
 type Client struct {
-	connectTimeout time.Duration
-	recvTimeout    time.Duration
-	maxFrame       uint32
-	codecs         []CodecID
-	registry       *registry
-	recovery       ClientRecoveryOptions
+	connectTimeout  time.Duration
+	recvTimeout     time.Duration
+	maxFrame        uint32
+	streamQueueSize int
+	codecs          []CodecID
+	registry        *registry
+	recovery        ClientRecoveryOptions
 }
 
 const (
@@ -86,6 +87,17 @@ func (c *Client) WithCodecs(codecs ...CodecID) *Client {
 // [Server.WithMaxFrame] on the server. The default is 16 MiB.
 func (c *Client) WithMaxFrame(maxFrame uint32) *Client {
 	c.maxFrame = maxFrame
+	return c
+}
+
+// WithStreamQueueSize sets how many received messages each stream buffers:
+// messages waiting for Recv or a handler, and frames waiting to be decoded.
+// When a stream's buffer is full, the connection stops reading until the
+// stream catches up, which holds up its other streams too. A smaller buffer
+// saves memory on connections with many streams but reaches that point
+// sooner. The default is 1024; zero or a negative value keeps the default.
+func (c *Client) WithStreamQueueSize(size int) *Client {
+	c.streamQueueSize = size
 	return c
 }
 
@@ -203,15 +215,13 @@ func (c *Client) connectAttempt(addr string, recovery bool, deadline time.Time) 
 }
 
 func (c *Client) connectVersion(addr string, version byte, deadline time.Time) (*Connection, error) {
-	if c.registry == nil {
-		c.registry = newRegistrySnapshot()
-	}
 	conn, err := dialBefore(addr, deadline)
 	if err != nil {
 		return nil, err
 	}
 	pending := newPendingConnection(conn, c.registry, nil, nil)
 	pending.connection.recvTimeout = c.recvTimeout
+	pending.connection.streamQueueSize = c.streamQueueSize
 	config, err := handshakeClient(conn, c.codecs, c.maxFrame, version)
 	if err != nil {
 		_ = conn.Close()
@@ -222,7 +232,6 @@ func (c *Client) connectVersion(addr string, version byte, deadline time.Time) (
 		return pending.startWithConfig(config), nil
 	}
 	connection, err := c.startRecoveryConnection(addr, pending, config)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		return nil, connectError(err, deadline)
 	}
@@ -244,6 +253,8 @@ func (c *Client) startRecoveryConnection(addr string, pending *pendingConnection
 		_ = pending.connection.conn.Close()
 		return nil, ErrResumeRejected{Reason: "initial attach rejected"}
 	}
+	// Clear the connect deadline before the reader arms its heartbeat deadline.
+	_ = pending.connection.conn.SetDeadline(time.Time{})
 
 	connection := pending.connection
 	connection.config = config

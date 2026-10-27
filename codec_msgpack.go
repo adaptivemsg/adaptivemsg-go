@@ -3,6 +3,7 @@ package adaptivemsg
 import (
 	"bytes"
 	"encoding"
+	"encoding/binary"
 	"reflect"
 	"sync"
 
@@ -55,9 +56,9 @@ func (msgpackMapCodec) DecodeInto(body any, dst any) error {
 	if !ok {
 		return ErrCodec{Message: "map body must be msgpack raw message"}
 	}
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(dst); err != nil {
+	d := getDecoder(raw)
+	defer putDecoder(d)
+	if err := d.dec.Decode(dst); err != nil {
 		return ErrCodec{Message: err.Error()}
 	}
 	return nil
@@ -78,19 +79,19 @@ func (msgpackCompactCodec) Encode(msg Message) ([]byte, error) {
 }
 
 func (msgpackCompactCodec) DecodeEnvelope(payload []byte) (Envelope, error) {
-	wire, values, err := decodeCompactEnvelope(payload)
+	wire, body, err := decodeCompactEnvelope(payload)
 	if err != nil {
 		return Envelope{}, err
 	}
-	return Envelope{Wire: wire, Body: values}, nil
+	return Envelope{Wire: wire, Body: body}, nil
 }
 
 func (msgpackCompactCodec) DecodeInto(body any, dst any) error {
-	raw, ok := body.([]msgpack.RawMessage)
+	b, ok := body.(compactBody)
 	if !ok {
-		return ErrCodec{Message: "compact body must be msgpack raw message list"}
+		return ErrCodec{Message: "compact body must be the fields of a compact payload"}
 	}
-	return decodeCompactInto(raw, dst)
+	return decodeCompactInto(b, dst)
 }
 
 type mapEnvelope struct {
@@ -98,14 +99,11 @@ type mapEnvelope struct {
 	Data any    `am:"data"`
 }
 
-type mapEnvelopeRaw struct {
-	Type string             `am:"type"`
-	Data msgpack.RawMessage `am:"data"`
-}
-
-type compactFieldCache struct {
-	mu     sync.RWMutex
-	values map[reflect.Type][]int
+// compactBody is the part of a compact payload after the wire name: count
+// encoded fields.
+type compactBody struct {
+	fields []byte
+	count  int
 }
 
 var (
@@ -117,38 +115,189 @@ var (
 	binaryUnmarshalerType  = reflect.TypeOf((*encoding.BinaryUnmarshaler)(nil)).Elem()
 	textMarshalerType      = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 	textUnmarshalerType    = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
-	compactFieldsCache     = compactFieldCache{values: make(map[reflect.Type][]int)}
+	marshalerTypes         = []reflect.Type{
+		msgpackMarshalerType,
+		msgpackUnmarshalerType,
+		msgpackCustomEncType,
+		msgpackCustomDecType,
+		binaryMarshalerType,
+		binaryUnmarshalerType,
+		textMarshalerType,
+		textUnmarshalerType,
+	}
 )
+
+// compactTypeInfo is what the compact codec needs to know about a struct type.
+// It is computed once per type.
+type compactTypeInfo struct {
+	// fields are the indices of the encoded fields, in order.
+	fields []int
+	// err tells why the type cannot be encoded field by field.
+	err error
+	// marshals reports that T or *T encodes itself, so the codec leaves it to
+	// msgpack.
+	marshals bool
+	// ptrMarshals reports that *T encodes itself.
+	ptrMarshals bool
+}
+
+// compact reports whether values of the type are encoded as an array of
+// their fields.
+func (i *compactTypeInfo) compact() bool {
+	return i.err == nil && !i.marshals
+}
+
+var compactTypes sync.Map // reflect.Type -> *compactTypeInfo
+
+func compactInfoFor(t reflect.Type) *compactTypeInfo {
+	if cached, ok := compactTypes.Load(t); ok {
+		return cached.(*compactTypeInfo)
+	}
+	info := &compactTypeInfo{}
+	if t.Kind() != reflect.Struct {
+		info.err = ErrInvalidMessage{Reason: "compact encoding requires struct type"}
+	} else {
+		info.fields = make([]int, 0, t.NumField())
+		for i := range t.NumField() {
+			if t.Field(i).PkgPath != "" {
+				info.err = ErrInvalidMessage{Reason: "compact encoding does not support unexported fields"}
+				info.fields = nil
+				break
+			}
+			info.fields = append(info.fields, i)
+		}
+		ptr := reflect.PointerTo(t)
+		for _, iface := range marshalerTypes {
+			if ptr.Implements(iface) {
+				info.ptrMarshals = true
+			}
+			if t.Implements(iface) || ptr.Implements(iface) {
+				info.marshals = true
+			}
+		}
+	}
+	actual, _ := compactTypes.LoadOrStore(t, info)
+	return actual.(*compactTypeInfo)
+}
+
+func compactFieldIndices(t reflect.Type) ([]int, error) {
+	info := compactInfoFor(t)
+	return info.fields, info.err
+}
+
+// pooledEncoder and pooledDecoder keep a msgpack encoder or decoder with its
+// buffer or reader for reuse.
+type pooledEncoder struct {
+	enc *msgpack.Encoder
+	buf bytes.Buffer
+}
+
+type pooledDecoder struct {
+	dec *msgpack.Decoder
+	r   bytes.Reader
+}
+
+// maxPooledBuffer keeps a huge message from pinning its buffer in the pool.
+const maxPooledBuffer = 64 << 10
+
+var (
+	encoderPool = sync.Pool{New: func() any {
+		e := &pooledEncoder{}
+		e.enc = msgpack.NewEncoder(&e.buf)
+		return e
+	}}
+	decoderPool = sync.Pool{New: func() any {
+		d := &pooledDecoder{}
+		d.dec = msgpack.NewDecoder(&d.r)
+		return d
+	}}
+)
+
+func getEncoder() *pooledEncoder {
+	e := encoderPool.Get().(*pooledEncoder)
+	e.buf.Reset()
+	e.enc.Reset(&e.buf)
+	e.enc.SetCustomStructTag("am")
+	return e
+}
+
+// bytes returns a copy of what e encoded, owned by the caller, and returns e
+// to the pool.
+func (e *pooledEncoder) bytes() []byte {
+	out := bytes.Clone(e.buf.Bytes())
+	putEncoder(e)
+	return out
+}
+
+func putEncoder(e *pooledEncoder) {
+	if e.buf.Cap() <= maxPooledBuffer {
+		encoderPool.Put(e)
+	}
+}
+
+func getDecoder(data []byte) *pooledDecoder {
+	d := decoderPool.Get().(*pooledDecoder)
+	d.r.Reset(data)
+	d.dec.Reset(&d.r)
+	d.dec.SetCustomStructTag("am")
+	return d
+}
+
+func putDecoder(d *pooledDecoder) {
+	d.r.Reset(nil)
+	decoderPool.Put(d)
+}
 
 func encodeMap(msg Message) ([]byte, error) {
 	wire, err := WireNameOf(msg)
 	if err != nil {
 		return nil, err
 	}
-	env := mapEnvelope{
-		Type: wire,
-		Data: msg,
-	}
-	var buf bytes.Buffer
-	enc := msgpack.NewEncoder(&buf)
-	enc.SetCustomStructTag("am")
-	if err := enc.Encode(&env); err != nil {
+	e := getEncoder()
+	if err := e.enc.Encode(&mapEnvelope{Type: wire, Data: msg}); err != nil {
+		putEncoder(e)
 		return nil, ErrCodec{Message: err.Error()}
 	}
-	return buf.Bytes(), nil
+	return e.bytes(), nil
 }
 
+// decodeMapEnvelope returns the wire name and the encoded data of a map
+// payload. The data is a slice of payload.
 func decodeMapEnvelope(payload []byte) (string, msgpack.RawMessage, error) {
-	var env mapEnvelopeRaw
-	dec := msgpack.NewDecoder(bytes.NewReader(payload))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(&env); err != nil {
+	d := getDecoder(payload)
+	defer putDecoder(d)
+	n, err := d.dec.DecodeMapLen()
+	if err != nil {
 		return "", nil, ErrCodec{Message: err.Error()}
 	}
-	if env.Type == "" {
+	var wire string
+	var data msgpack.RawMessage
+	for range max(n, 0) {
+		key, err := d.dec.DecodeString()
+		if err != nil {
+			return "", nil, ErrCodec{Message: err.Error()}
+		}
+		switch key {
+		case "type":
+			if wire, err = d.dec.DecodeString(); err != nil {
+				return "", nil, ErrCodec{Message: err.Error()}
+			}
+		case "data":
+			start := len(payload) - d.r.Len()
+			if err := d.dec.Skip(); err != nil {
+				return "", nil, ErrCodec{Message: err.Error()}
+			}
+			data = payload[start : len(payload)-d.r.Len()]
+		default:
+			if err := d.dec.Skip(); err != nil {
+				return "", nil, ErrCodec{Message: err.Error()}
+			}
+		}
+	}
+	if wire == "" {
 		return "", nil, ErrCodec{Message: "map payload missing type"}
 	}
-	return env.Type, env.Data, nil
+	return wire, data, nil
 }
 
 func encodeCompact(msg Message) ([]byte, error) {
@@ -169,44 +318,219 @@ func encodeCompact(msg Message) ([]byte, error) {
 	if rv.Kind() != reflect.Struct {
 		return nil, ErrCodec{Message: "compact encode requires struct message"}
 	}
-	indices, err := compactFieldIndices(rv.Type())
+	fields, err := compactFieldIndices(rv.Type())
 	if err != nil {
 		return nil, err
 	}
-	items := make([]any, 0, 1+len(indices))
-	items = append(items, wire)
-	for _, idx := range indices {
-		value, err := compactEncodeValue(rv.Field(idx))
-		if err != nil {
-			return nil, err
+	e := getEncoder()
+	if err := encodeCompactFields(e.enc, wire, rv, fields); err != nil {
+		putEncoder(e)
+		return nil, err
+	}
+	return e.bytes(), nil
+}
+
+func encodeCompactFields(enc *msgpack.Encoder, wire string, rv reflect.Value, fields []int) error {
+	if err := enc.EncodeArrayLen(1 + len(fields)); err != nil {
+		return ErrCodec{Message: err.Error()}
+	}
+	if err := enc.EncodeString(wire); err != nil {
+		return ErrCodec{Message: err.Error()}
+	}
+	for _, idx := range fields {
+		if err := encodeCompactValue(enc, rv.Field(idx)); err != nil {
+			return err
 		}
-		items = append(items, value)
 	}
-	var buf bytes.Buffer
-	enc := msgpack.NewEncoder(&buf)
-	enc.SetCustomStructTag("am")
-	if err := enc.Encode(items); err != nil {
-		return nil, ErrCodec{Message: err.Error()}
-	}
-	return buf.Bytes(), nil
+	return nil
 }
 
-func decodeCompactEnvelope(payload []byte) (string, []msgpack.RawMessage, error) {
-	var rawItems []msgpack.RawMessage
-	if err := msgpack.Unmarshal(payload, &rawItems); err != nil {
-		return "", nil, ErrCodec{Message: err.Error()}
+// encodeCompactValue encodes a value with every struct in it, however deep,
+// as an array of its fields. Types that encode themselves, and values that
+// are not structs or containers of them, go to msgpack as they are.
+func encodeCompactValue(enc *msgpack.Encoder, value reflect.Value) error {
+	if !value.IsValid() || isNilValue(value) {
+		return codecErr(enc.EncodeNil())
 	}
-	if len(rawItems) == 0 {
-		return "", nil, ErrCodec{Message: "compact payload must be a non-empty array"}
+	switch value.Kind() {
+	case reflect.Interface:
+		return encodeCompactValue(enc, value.Elem())
+	case reflect.Pointer:
+		elem := value.Elem()
+		if elem.Kind() == reflect.Struct && !compactInfoFor(elem.Type()).compact() {
+			return codecErr(enc.EncodeValue(value))
+		}
+		return encodeCompactValue(enc, elem)
+	case reflect.Struct:
+		return encodeCompactStruct(enc, value)
+	case reflect.Slice:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return codecErr(enc.EncodeBytes(value.Bytes()))
+		}
+		return encodeCompactElements(enc, value)
+	case reflect.Array:
+		return encodeCompactElements(enc, value)
+	case reflect.Map:
+		return encodeCompactMap(enc, value)
+	default:
+		return codecErr(enc.EncodeValue(value))
 	}
-	var name string
-	if err := msgpack.Unmarshal(rawItems[0], &name); err != nil {
-		return "", nil, ErrCodec{Message: "compact message name must be a string"}
-	}
-	return name, rawItems[1:], nil
 }
 
-func decodeCompactInto(raw []msgpack.RawMessage, dst any) error {
+// isNilValue reports whether value is a nil interface, pointer, slice or map.
+func isNilValue(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Interface, reflect.Pointer, reflect.Slice, reflect.Map:
+		return value.IsNil()
+	}
+	return false
+}
+
+func encodeCompactStruct(enc *msgpack.Encoder, value reflect.Value) error {
+	info := compactInfoFor(value.Type())
+	if !info.compact() {
+		if value.CanAddr() && info.ptrMarshals {
+			return codecErr(enc.EncodeValue(value.Addr()))
+		}
+		return codecErr(enc.EncodeValue(value))
+	}
+	if err := enc.EncodeArrayLen(len(info.fields)); err != nil {
+		return codecErr(err)
+	}
+	for _, idx := range info.fields {
+		if err := encodeCompactValue(enc, value.Field(idx)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func encodeCompactMap(enc *msgpack.Encoder, value reflect.Value) error {
+	if isStructKey(value.Type().Key()) {
+		return ErrInvalidMessage{Reason: "compact encoding does not support struct map keys"}
+	}
+	if err := enc.EncodeMapLen(value.Len()); err != nil {
+		return codecErr(err)
+	}
+	iter := value.MapRange()
+	for iter.Next() {
+		if !compactKeyComparable(iter.Key()) {
+			return ErrInvalidMessage{Reason: "compact encoding requires comparable map keys"}
+		}
+		if err := encodeCompactValue(enc, iter.Key()); err != nil {
+			return err
+		}
+		if err := encodeCompactValue(enc, iter.Value()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isStructKey reports whether a map key type is a struct or a pointer to
+// one, which compact encoding would turn into an array.
+func isStructKey(keyType reflect.Type) bool {
+	if keyType.Kind() == reflect.Pointer {
+		keyType = keyType.Elem()
+	}
+	return keyType.Kind() == reflect.Struct
+}
+
+func encodeCompactElements(enc *msgpack.Encoder, value reflect.Value) error {
+	if err := enc.EncodeArrayLen(value.Len()); err != nil {
+		return codecErr(err)
+	}
+	for i := range value.Len() {
+		if err := encodeCompactValue(enc, value.Index(i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compactKeyComparable reports whether a map key stays comparable once
+// encoded: a nil key does not, nor does one that becomes an array.
+func compactKeyComparable(key reflect.Value) bool {
+	for key.Kind() == reflect.Interface || key.Kind() == reflect.Pointer {
+		if key.IsNil() {
+			return false
+		}
+		key = key.Elem()
+	}
+	switch key.Kind() {
+	case reflect.Array:
+		return false
+	case reflect.Struct:
+		return !compactInfoFor(key.Type()).compact()
+	}
+	return true
+}
+
+func codecErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return ErrCodec{Message: err.Error()}
+}
+
+// decodeCompactEnvelope returns the wire name and the fields of a compact
+// payload. The fields are a slice of payload.
+func decodeCompactEnvelope(payload []byte) (string, compactBody, error) {
+	n, rest, ok := readArrayHeader(payload)
+	if !ok || n == 0 {
+		return "", compactBody{}, ErrCodec{Message: "compact payload must be a non-empty array"}
+	}
+	name, rest, ok := readStringValue(rest)
+	if !ok {
+		return "", compactBody{}, ErrCodec{Message: "compact message name must be a string"}
+	}
+	return name, compactBody{fields: rest, count: n - 1}, nil
+}
+
+// readArrayHeader reads a msgpack array header.
+func readArrayHeader(b []byte) (int, []byte, bool) {
+	if len(b) == 0 {
+		return 0, nil, false
+	}
+	c := b[0]
+	switch {
+	case msgpcode.IsFixedArray(c):
+		return int(c & msgpcode.FixedArrayMask), b[1:], true
+	case c == msgpcode.Array16 && len(b) >= 3:
+		return int(binary.BigEndian.Uint16(b[1:3])), b[3:], true
+	case c == msgpcode.Array32 && len(b) >= 5:
+		return int(binary.BigEndian.Uint32(b[1:5])), b[5:], true
+	}
+	return 0, nil, false
+}
+
+// readStringValue reads a msgpack string. Like msgpack's own string decoding
+// it also accepts bin.
+func readStringValue(b []byte) (string, []byte, bool) {
+	if len(b) == 0 {
+		return "", nil, false
+	}
+	c := b[0]
+	var n, header int
+	switch {
+	case msgpcode.IsFixedString(c):
+		n, header = int(c&msgpcode.FixedStrMask), 1
+	case (c == msgpcode.Str8 || c == msgpcode.Bin8) && len(b) >= 2:
+		n, header = int(b[1]), 2
+	case (c == msgpcode.Str16 || c == msgpcode.Bin16) && len(b) >= 3:
+		n, header = int(binary.BigEndian.Uint16(b[1:3])), 3
+	case (c == msgpcode.Str32 || c == msgpcode.Bin32) && len(b) >= 5:
+		n, header = int(binary.BigEndian.Uint32(b[1:5])), 5
+	default:
+		return "", nil, false
+	}
+	if len(b)-header < n {
+		return "", nil, false
+	}
+	return string(b[header : header+n]), b[header+n:], true
+}
+
+func decodeCompactInto(body compactBody, dst any) error {
 	if dst == nil {
 		return ErrInvalidMessage{Reason: "compact decode requires non-nil destination"}
 	}
@@ -222,255 +546,108 @@ func decodeCompactInto(raw []msgpack.RawMessage, dst any) error {
 	if err != nil {
 		return err
 	}
-	if len(raw) != len(fields) {
-		return ErrCompactFieldCount{Expected: len(fields), Got: len(raw)}
+	if body.count != len(fields) {
+		return ErrCompactFieldCount{Expected: len(fields), Got: body.count}
 	}
-	for i, fieldIndex := range fields {
-		field := elem.Field(fieldIndex)
-		if !field.CanSet() {
-			return ErrInvalidMessage{Reason: "compact decode requires exported fields"}
-		}
-		if err := decodeCompactValue(raw[i], field); err != nil {
+	d := getDecoder(body.fields)
+	defer putDecoder(d)
+	for _, fieldIndex := range fields {
+		if err := decodeCompactValue(d.dec, elem.Field(fieldIndex)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func compactFieldIndices(t reflect.Type) ([]int, error) {
-	if t.Kind() != reflect.Struct {
-		return nil, ErrInvalidMessage{Reason: "compact encoding requires struct type"}
-	}
-	compactFieldsCache.mu.RLock()
-	cached, ok := compactFieldsCache.values[t]
-	compactFieldsCache.mu.RUnlock()
-	if ok {
-		return cached, nil
-	}
-	indices := make([]int, 0, t.NumField())
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if field.PkgPath != "" {
-			return nil, ErrInvalidMessage{Reason: "compact encoding does not support unexported fields"}
-		}
-		indices = append(indices, i)
-	}
-	compactFieldsCache.mu.Lock()
-	compactFieldsCache.values[t] = indices
-	compactFieldsCache.mu.Unlock()
-	return indices, nil
-}
-
-func compactEncodeValue(value reflect.Value) (any, error) {
-	if !value.IsValid() {
-		return nil, nil
-	}
-	switch value.Kind() {
-	case reflect.Interface:
-		if value.IsNil() {
-			return nil, nil
-		}
-		return compactEncodeValue(value.Elem())
-	case reflect.Pointer:
-		if value.IsNil() {
-			return nil, nil
-		}
-		elem := value.Elem()
-		if elem.Kind() == reflect.Struct && !isCompactStructType(elem.Type()) {
-			return value.Interface(), nil
-		}
-		return compactEncodeValue(elem)
-	case reflect.Struct:
-		if !isCompactStructType(value.Type()) {
-			if value.CanAddr() && implementsAnyPointer(value.Type(),
-				msgpackMarshalerType,
-				msgpackUnmarshalerType,
-				msgpackCustomEncType,
-				msgpackCustomDecType,
-				binaryMarshalerType,
-				binaryUnmarshalerType,
-				textMarshalerType,
-				textUnmarshalerType,
-			) {
-				return value.Addr().Interface(), nil
-			}
-			return value.Interface(), nil
-		}
-		indices, err := compactFieldIndices(value.Type())
-		if err != nil {
-			return nil, err
-		}
-		items := make([]any, 0, len(indices))
-		for _, idx := range indices {
-			item, err := compactEncodeValue(value.Field(idx))
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, item)
-		}
-		return items, nil
-	case reflect.Slice:
-		if value.IsNil() {
-			return nil, nil
-		}
-		if value.Type().Elem().Kind() == reflect.Uint8 {
-			buf := make([]byte, value.Len())
-			reflect.Copy(reflect.ValueOf(buf), value)
-			return buf, nil
-		}
-		items := make([]any, value.Len())
-		for i := 0; i < value.Len(); i++ {
-			item, err := compactEncodeValue(value.Index(i))
-			if err != nil {
-				return nil, err
-			}
-			items[i] = item
-		}
-		return items, nil
-	case reflect.Array:
-		items := make([]any, value.Len())
-		for i := 0; i < value.Len(); i++ {
-			item, err := compactEncodeValue(value.Index(i))
-			if err != nil {
-				return nil, err
-			}
-			items[i] = item
-		}
-		return items, nil
-	case reflect.Map:
-		if value.IsNil() {
-			return nil, nil
-		}
-		keyType := value.Type().Key()
-		if keyType.Kind() == reflect.Struct || (keyType.Kind() == reflect.Pointer && keyType.Elem().Kind() == reflect.Struct) {
-			return nil, ErrInvalidMessage{Reason: "compact encoding does not support struct map keys"}
-		}
-		out := make(map[any]any, value.Len())
-		for _, key := range value.MapKeys() {
-			encodedKey, err := compactEncodeValue(key)
-			if err != nil {
-				return nil, err
-			}
-			if !isComparableKey(encodedKey) {
-				return nil, ErrInvalidMessage{Reason: "compact encoding requires comparable map keys"}
-			}
-			encodedValue, err := compactEncodeValue(value.MapIndex(key))
-			if err != nil {
-				return nil, err
-			}
-			out[encodedKey] = encodedValue
-		}
-		return out, nil
-	default:
-		return value.Interface(), nil
-	}
-}
-
-func decodeCompactValue(raw msgpack.RawMessage, dst reflect.Value) error {
+// decodeCompactValue decodes the next value, encoded by encodeCompactValue,
+// into dst.
+func decodeCompactValue(dec *msgpack.Decoder, dst reflect.Value) error {
 	if !dst.CanSet() {
 		return ErrInvalidMessage{Reason: "compact decode requires settable destination"}
 	}
+	code, err := dec.PeekCode()
+	if err != nil {
+		return codecErr(err)
+	}
+	if code == msgpcode.Nil {
+		switch dst.Kind() {
+		case reflect.Interface, reflect.Pointer, reflect.Slice, reflect.Map:
+			dst.Set(reflect.Zero(dst.Type()))
+			return codecErr(dec.DecodeNil())
+		case reflect.Array:
+			return ErrCodec{Message: "compact decode cannot assign nil to array"}
+		case reflect.Struct:
+			// Decoded below, like any other struct value.
+		default:
+			return ErrCodec{Message: "compact decode cannot assign nil to value"}
+		}
+	}
 	switch dst.Kind() {
 	case reflect.Interface:
-		if isNilRaw(raw) {
-			dst.Set(reflect.Zero(dst.Type()))
-			return nil
-		}
 		var out any
-		dec := msgpack.NewDecoder(bytes.NewReader(raw))
-		dec.SetCustomStructTag("am")
 		if err := dec.Decode(&out); err != nil {
-			return ErrCodec{Message: err.Error()}
+			return codecErr(err)
 		}
 		dst.Set(reflect.ValueOf(out))
 		return nil
 	case reflect.Pointer:
-		if isNilRaw(raw) {
-			dst.Set(reflect.Zero(dst.Type()))
-			return nil
-		}
 		elem := reflect.New(dst.Type().Elem()).Elem()
-		if err := decodeCompactValue(raw, elem); err != nil {
+		if err := decodeCompactValue(dec, elem); err != nil {
 			return err
 		}
 		dst.Set(elem.Addr())
 		return nil
 	case reflect.Struct:
-		if !isCompactStructType(dst.Type()) {
-			return decodeMsgpackInto(raw, dst)
-		}
-		return decodeCompactStruct(raw, dst)
+		return decodeCompactStruct(dec, dst)
 	case reflect.Slice:
-		if isNilRaw(raw) {
-			dst.Set(reflect.Zero(dst.Type()))
-			return nil
-		}
-		if dst.Type().Elem().Kind() == reflect.Uint8 {
-			var data []byte
-			dec := msgpack.NewDecoder(bytes.NewReader(raw))
-			dec.SetCustomStructTag("am")
-			if err := dec.Decode(&data); err != nil {
-				return ErrCodec{Message: err.Error()}
-			}
-			dst.Set(reflect.ValueOf(data).Convert(dst.Type()))
-			return nil
-		}
-		return decodeCompactSlice(raw, dst)
+		return decodeCompactSlice(dec, dst)
 	case reflect.Array:
-		if isNilRaw(raw) {
-			return ErrCodec{Message: "compact decode cannot assign nil to array"}
-		}
-		return decodeCompactArray(raw, dst)
+		return decodeCompactArray(dec, dst)
 	case reflect.Map:
-		if isNilRaw(raw) {
-			dst.Set(reflect.Zero(dst.Type()))
-			return nil
-		}
-		return decodeCompactMap(raw, dst)
+		return decodeCompactMap(dec, dst)
 	default:
-		if isNilRaw(raw) {
-			return ErrCodec{Message: "compact decode cannot assign nil to value"}
-		}
-		return decodeMsgpackInto(raw, dst)
+		return codecErr(dec.Decode(dst.Addr().Interface()))
 	}
 }
 
-func decodeCompactStruct(raw msgpack.RawMessage, dst reflect.Value) error {
-	var items []msgpack.RawMessage
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(&items); err != nil {
-		return ErrCodec{Message: err.Error()}
+func decodeCompactStruct(dec *msgpack.Decoder, dst reflect.Value) error {
+	info := compactInfoFor(dst.Type())
+	if !info.compact() {
+		return codecErr(dec.Decode(dst.Addr().Interface()))
 	}
-	fields, err := compactFieldIndices(dst.Type())
+	n, err := dec.DecodeArrayLen()
 	if err != nil {
-		return err
+		return codecErr(err)
 	}
-	if len(items) != len(fields) {
-		return ErrCompactFieldCount{Expected: len(fields), Got: len(items)}
+	n = max(n, 0)
+	if n != len(info.fields) {
+		return ErrCompactFieldCount{Expected: len(info.fields), Got: n}
 	}
-	for i, fieldIndex := range fields {
-		field := dst.Field(fieldIndex)
-		if !field.CanSet() {
-			return ErrInvalidMessage{Reason: "compact decode requires exported fields"}
-		}
-		if err := decodeCompactValue(items[i], field); err != nil {
+	for _, fieldIndex := range info.fields {
+		if err := decodeCompactValue(dec, dst.Field(fieldIndex)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func decodeCompactSlice(raw msgpack.RawMessage, dst reflect.Value) error {
-	var items []msgpack.RawMessage
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(&items); err != nil {
-		return ErrCodec{Message: err.Error()}
+func decodeCompactSlice(dec *msgpack.Decoder, dst reflect.Value) error {
+	if dst.Type().Elem().Kind() == reflect.Uint8 {
+		var data []byte
+		if err := dec.Decode(&data); err != nil {
+			return codecErr(err)
+		}
+		dst.Set(reflect.ValueOf(data).Convert(dst.Type()))
+		return nil
 	}
-	slice := reflect.MakeSlice(dst.Type(), len(items), len(items))
-	for i := range items {
-		if err := decodeCompactValue(items[i], slice.Index(i)); err != nil {
+	n, err := dec.DecodeArrayLen()
+	if err != nil {
+		return codecErr(err)
+	}
+	n = max(n, 0)
+	slice := reflect.MakeSlice(dst.Type(), n, n)
+	for i := range n {
+		if err := decodeCompactValue(dec, slice.Index(i)); err != nil {
 			return err
 		}
 	}
@@ -478,118 +655,52 @@ func decodeCompactSlice(raw msgpack.RawMessage, dst reflect.Value) error {
 	return nil
 }
 
-func decodeCompactArray(raw msgpack.RawMessage, dst reflect.Value) error {
-	var items []msgpack.RawMessage
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(&items); err != nil {
-		return ErrCodec{Message: err.Error()}
+func decodeCompactArray(dec *msgpack.Decoder, dst reflect.Value) error {
+	n, err := dec.DecodeArrayLen()
+	if err != nil {
+		return codecErr(err)
 	}
-	if len(items) != dst.Len() {
-		return ErrCompactFieldCount{Expected: dst.Len(), Got: len(items)}
+	if n != dst.Len() {
+		return ErrCompactFieldCount{Expected: dst.Len(), Got: max(n, 0)}
 	}
-	for i := range items {
-		if err := decodeCompactValue(items[i], dst.Index(i)); err != nil {
+	for i := range n {
+		if err := decodeCompactValue(dec, dst.Index(i)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func decodeCompactMap(raw msgpack.RawMessage, dst reflect.Value) error {
-	if !dst.CanSet() {
-		return ErrInvalidMessage{Reason: "compact decode requires settable map"}
-	}
+func decodeCompactMap(dec *msgpack.Decoder, dst reflect.Value) error {
 	keyType := dst.Type().Key()
-	if keyType.Kind() == reflect.Struct || (keyType.Kind() == reflect.Pointer && keyType.Elem().Kind() == reflect.Struct) {
+	if isStructKey(keyType) {
 		return ErrInvalidMessage{Reason: "compact decode does not support struct map keys"}
 	}
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
 	length, err := dec.DecodeMapLen()
 	if err != nil {
-		return ErrCodec{Message: err.Error()}
+		return codecErr(err)
 	}
 	if length == -1 {
 		dst.Set(reflect.Zero(dst.Type()))
 		return nil
 	}
 	result := reflect.MakeMapWithSize(dst.Type(), length)
-	for i := 0; i < length; i++ {
+	for range length {
 		key := reflect.New(keyType).Elem()
 		if err := dec.Decode(key.Addr().Interface()); err != nil {
-			return ErrCodec{Message: err.Error()}
+			return codecErr(err)
 		}
 		if keyType.Kind() == reflect.Interface && !isComparableKey(key.Interface()) {
 			return ErrInvalidMessage{Reason: "compact decode requires comparable map keys"}
 		}
-		rawValue, err := dec.DecodeRaw()
-		if err != nil {
-			return ErrCodec{Message: err.Error()}
-		}
 		val := reflect.New(dst.Type().Elem()).Elem()
-		if err := decodeCompactValue(rawValue, val); err != nil {
+		if err := decodeCompactValue(dec, val); err != nil {
 			return err
 		}
 		result.SetMapIndex(key, val)
 	}
 	dst.Set(result)
 	return nil
-}
-
-func decodeMsgpackInto(raw msgpack.RawMessage, dst reflect.Value) error {
-	dec := msgpack.NewDecoder(bytes.NewReader(raw))
-	dec.SetCustomStructTag("am")
-	if err := dec.Decode(dst.Addr().Interface()); err != nil {
-		return ErrCodec{Message: err.Error()}
-	}
-	return nil
-}
-
-func isCompactStructType(t reflect.Type) bool {
-	if t.Kind() != reflect.Struct {
-		return false
-	}
-	if implementsAny(t,
-		msgpackMarshalerType,
-		msgpackUnmarshalerType,
-		msgpackCustomEncType,
-		msgpackCustomDecType,
-		binaryMarshalerType,
-		binaryUnmarshalerType,
-		textMarshalerType,
-		textUnmarshalerType,
-	) {
-		return false
-	}
-	_, err := compactFieldIndices(t)
-	return err == nil
-}
-
-func implementsAny(t reflect.Type, ifaces ...reflect.Type) bool {
-	for _, iface := range ifaces {
-		if t.Implements(iface) {
-			return true
-		}
-		if reflect.PointerTo(t).Implements(iface) {
-			return true
-		}
-	}
-	return false
-}
-
-func implementsAnyPointer(t reflect.Type, ifaces ...reflect.Type) bool {
-	ptr := reflect.PointerTo(t)
-	for _, iface := range ifaces {
-		if ptr.Implements(iface) {
-			return true
-		}
-	}
-	return false
-}
-
-func isNilRaw(raw msgpack.RawMessage) bool {
-	return len(raw) == 1 && raw[0] == msgpcode.Nil
 }
 
 func isComparableKey(key any) bool {

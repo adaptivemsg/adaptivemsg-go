@@ -4,7 +4,7 @@ import "reflect"
 
 type rawMessage struct {
 	Wire  string
-	Codec CodecID
+	Codec CodecImpl
 	Body  any
 }
 
@@ -22,11 +22,7 @@ func decodeRawAs[T any](raw rawMessage) (T, error) {
 	if err != nil {
 		return zero, err
 	}
-	codec, ok := codecByID(raw.Codec)
-	if !ok {
-		return zero, ErrUnsupportedCodec{Value: byte(raw.Codec)}
-	}
-	if err := codec.DecodeInto(raw.Body, msgPtr.Interface()); err != nil {
+	if err := raw.Codec.DecodeInto(raw.Body, msgPtr.Interface()); err != nil {
 		return zero, err
 	}
 	if t.Kind() == reflect.Pointer {
@@ -35,16 +31,12 @@ func decodeRawAs[T any](raw rawMessage) (T, error) {
 	return msgPtr.Elem().Interface().(T), nil
 }
 
-func newRawMessageFromPayload(codecID CodecID, payload []byte) (rawMessage, error) {
-	codec, ok := codecByID(codecID)
-	if !ok {
-		return rawMessage{}, ErrUnsupportedCodec{Value: byte(codecID)}
-	}
+func newRawMessageFromPayload(codec CodecImpl, payload []byte) (rawMessage, error) {
 	env, err := codec.DecodeEnvelope(payload)
 	if err != nil {
 		return rawMessage{}, err
 	}
-	return rawMessage{Wire: env.Wire, Codec: codecID, Body: env.Body}, nil
+	return rawMessage{Wire: env.Wire, Codec: codec, Body: env.Body}, nil
 }
 
 func decodeRawWithRegistry(raw rawMessage, reg *registry) (Message, error) {
@@ -59,11 +51,7 @@ func decodeRawWithRegistry(raw rawMessage, reg *registry) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	codec, ok := codecByID(raw.Codec)
-	if !ok {
-		return nil, ErrUnsupportedCodec{Value: byte(raw.Codec)}
-	}
-	if err := codec.DecodeInto(raw.Body, msg); err != nil {
+	if err := raw.Codec.DecodeInto(raw.Body, msg); err != nil {
 		return nil, err
 	}
 	return msg, nil

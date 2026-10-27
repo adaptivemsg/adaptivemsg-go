@@ -28,23 +28,16 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version b
 		return connConfig{}, ErrUnsupportedFrameVersion{Version: version}
 	}
 
-	request := make([]byte, handshakeHeaderLen)
+	// The header and the codec list go out in one write.
+	request := make([]byte, handshakeHeaderLen+len(codecs))
 	copy(request[0:2], handshakeMagic[:])
 	request[2] = version
 	request[3] = byte(len(codecs))
-	request[4] = 0
-	request[5] = 0
-	request[6] = 0
-	request[7] = 0
 	binary.BigEndian.PutUint32(request[8:12], maxFrame)
-	if err := writeFull(conn, request); err != nil {
-		return connConfig{}, err
-	}
-	list := make([]byte, len(codecs))
 	for i, codecID := range codecs {
-		list[i] = byte(codecID)
+		request[handshakeHeaderLen+i] = byte(codecID)
 	}
-	if err := writeFull(conn, list); err != nil {
+	if err := writeFull(conn, request); err != nil {
 		return connConfig{}, err
 	}
 
@@ -68,15 +61,24 @@ func handshakeClient(conn net.Conn, codecs []CodecID, maxFrame uint32, version b
 	if !containsCodec(codecs, selected) {
 		return connConfig{}, ErrNoCommonCodec{}
 	}
-	codec, ok := codecByID(selected)
+	return newConnConfig(replyVersion, selected, serverMax)
+}
+
+func newConnConfig(version byte, codecID CodecID, maxFrame uint32) (connConfig, error) {
+	codec, ok := codecByID(codecID)
 	if !ok {
-		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
+		return connConfig{}, ErrUnsupportedCodec{Value: byte(codecID)}
+	}
+	headerLen, err := frameHeaderLenForVersion(version)
+	if err != nil {
+		return connConfig{}, err
 	}
 	return connConfig{
-		version:  replyVersion,
-		codecID:  selected,
-		codec:    codec,
-		maxFrame: serverMax,
+		version:   version,
+		codecID:   codecID,
+		codec:     codec,
+		maxFrame:  maxFrame,
+		headerLen: headerLen,
 	}, nil
 }
 
@@ -127,16 +129,7 @@ func handshakeServer(conn net.Conn, codecs []CodecID, maxFrame uint32, recoveryE
 	if err := writeHandshakeReply(conn, 1, version, selected, negotiatedMax); err != nil {
 		return connConfig{}, err
 	}
-	codec, ok := codecByID(selected)
-	if !ok {
-		return connConfig{}, ErrUnsupportedCodec{Value: byte(selected)}
-	}
-	return connConfig{
-		version:  version,
-		codecID:  selected,
-		codec:    codec,
-		maxFrame: negotiatedMax,
-	}, nil
+	return newConnConfig(version, selected, negotiatedMax)
 }
 
 func isSupportedProtocolVersion(version byte) bool {

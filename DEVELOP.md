@@ -378,20 +378,21 @@ Connection transport state includes:
 - `recovery *recoveryState`
 
 Replay-related state:
-- `nextSendSeq uint64`
-- replay retention keyed by sequence
-- live send deque for new frames
-- resume deque populated on reconnect
+- `nextSendSeq atomic.Uint64`
+- replay retention keyed by sequence (`replayBuffer`, acknowledged frames
+  dropped from the head)
+- live frames wait in the `outbound` channel while no transport is attached
+- the recovery writer keeps the frames to resend after a reconnect in a local
+  slice; `resumeDepth` mirrors its length for diagnostics
 
 `recoveryState` includes:
 - `connectionID [16]byte`
 - `resumeSecret [16]byte`
 - negotiated timing/batching (`AckDelay`, `AckEvery`, heartbeat values)
-- `lastRecvSeq uint64`
-- `lastAckSent uint64`
-- `ackPending uint32`
-- `ackDue bool`
-- `liveQueue`, `resumeQueue`
+- `lastRecvSeq uint64`, `lastAckSent uint64`, `ackPending uint32` under `mu`;
+  the reader keeps its own copy of `lastRecvSeq` for the per-frame check
+- `ackDue atomic.Bool` and `ackDueAt` so the writer checks for a due ACK
+  without taking `mu`
 - atomic mirrors for heartbeat/read-deadline hot path
 - detached expiry timer
 - client reconnect guards/parameters

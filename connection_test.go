@@ -578,7 +578,7 @@ func TestProtocolErrorOnOpenedStreamSendsFIN(t *testing.T) {
 	defer conn.Close()
 
 	stream := conn.NewStream()
-	if err := stream.inboxQ(rawMessage{Wire: "am.test.Other", Codec: CodecMsgpackMap}); err != nil {
+	if err := stream.inboxQ(rawMessage{Wire: "am.test.Other", Codec: mustCodec(t, CodecMsgpackMap)}); err != nil {
 		t.Fatalf("inboxQ: %v", err)
 	}
 	if _, err := stream.Recv[*connTestEchoReply](); !errors.As(err, &ErrTypeMismatch{}) {
@@ -749,7 +749,7 @@ func TestConnectionReadFrameTooLarge(t *testing.T) {
 		done <- err
 	}()
 
-	_, _, _, _, err := conn.readFrame()
+	_, _, _, _, err := conn.readFrameFrom(conn.conn)
 	var tooLarge ErrFrameTooLarge
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
@@ -829,7 +829,7 @@ func TestConnectionWriteFrameShortWrite(t *testing.T) {
 	payload := []byte("hello, short write")
 	errCh := make(chan error, 1)
 	go func() {
-		streamID, seq, _, gotPayload, err := reader.readFrame()
+		streamID, seq, _, gotPayload, err := reader.readFrameFrom(reader.conn)
 		if err != nil {
 			errCh <- err
 			return
@@ -870,7 +870,6 @@ func TestConnectionWriteReadFrameV3(t *testing.T) {
 			maxFrame: defaultMaxFrame,
 		},
 	}
-	writer.writer = bufio.NewWriter(writer.conn)
 	reader := &Connection{
 		conn: serverConn,
 		config: connConfig{
@@ -882,7 +881,7 @@ func TestConnectionWriteReadFrameV3(t *testing.T) {
 	payload := []byte("hello, v3")
 	errCh := make(chan error, 1)
 	go func() {
-		streamID, seq, _, gotPayload, err := reader.readFrame()
+		streamID, seq, _, gotPayload, err := reader.readFrameFrom(reader.conn)
 		if err != nil {
 			errCh <- err
 			return
@@ -902,8 +901,8 @@ func TestConnectionWriteReadFrameV3(t *testing.T) {
 		errCh <- nil
 	}()
 
-	if err := writer.writeFrame(9, 42, 0, payload); err != nil {
-		t.Fatalf("writeFrame: %v", err)
+	if err := writer.writeFrameTo(bufio.NewWriter(writer.conn), 9, 42, 0, payload); err != nil {
+		t.Fatalf("writeFrameTo: %v", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("readFrame: %v", err)

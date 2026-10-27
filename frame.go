@@ -61,6 +61,14 @@ func frameHeaderLenForVersion(version byte) (int, error) {
 	}
 }
 
+// headerLen returns the frame header length for the negotiated version.
+func (c *Connection) headerLen() (int, error) {
+	if c.config.headerLen > 0 {
+		return c.config.headerLen, nil
+	}
+	return frameHeaderLenForVersion(c.config.version)
+}
+
 func (c *Connection) buildHeader(streamID uint32, seq uint64, flags FrameFlags, payloadLen int) ([frameHeaderLenV3]byte, int, error) {
 	if payloadLen < 0 || uint64(payloadLen) > uint64(^uint32(0)) {
 		return [frameHeaderLenV3]byte{}, 0, ErrFrameTooLarge{Size: payloadLen}
@@ -68,7 +76,7 @@ func (c *Connection) buildHeader(streamID uint32, seq uint64, flags FrameFlags, 
 	if uint32(payloadLen) > c.config.maxFrame {
 		return [frameHeaderLenV3]byte{}, 0, ErrFrameTooLarge{Size: payloadLen}
 	}
-	headerLen, err := frameHeaderLenForVersion(c.config.version)
+	headerLen, err := c.headerLen()
 	if err != nil {
 		return [frameHeaderLenV3]byte{}, 0, err
 	}
@@ -101,27 +109,11 @@ func (c *Connection) parseHeader(header []byte) (uint32, uint64, FrameFlags, int
 	return streamID, seq, flags, int(payloadLen), nil
 }
 
-func (c *Connection) writeFrame(streamID uint32, seq uint64, flags FrameFlags, payload []byte) error {
-	return c.writeFrameTo(c.writer, streamID, seq, flags, payload)
-}
-
+// writeFrameTo writes a frame and flushes conn if it is buffered.
 func (c *Connection) writeFrameTo(conn io.Writer, streamID uint32, seq uint64, flags FrameFlags, payload []byte) error {
-	header, headerLen, err := c.buildHeader(streamID, seq, flags, len(payload))
-	if err != nil {
+	if err := c.writeFrameNoFlush(conn, streamID, seq, flags, payload); err != nil {
 		return err
 	}
-	if err := writeFull(conn, header[:headerLen]); err != nil {
-		return err
-	}
-	if err := writeFull(conn, payload); err != nil {
-		return err
-	}
-	c.debug.framesWritten.Add(1)
-	c.debug.bytesWritten.Add(uint64(headerLen + len(payload)))
-	if streamID == controlStreamID {
-		c.debug.controlFramesWritten.Add(1)
-	}
-	// Flush if the writer supports it (buffered writer).
 	if bw, ok := conn.(*bufio.Writer); ok {
 		return bw.Flush()
 	}
@@ -158,12 +150,8 @@ func isMalformedFrameError(err error) bool {
 	return false
 }
 
-func (c *Connection) readFrame() (uint32, uint64, FrameFlags, []byte, error) {
-	return c.readFrameFrom(c.conn)
-}
-
 func (c *Connection) readFrameFrom(conn io.Reader) (uint32, uint64, FrameFlags, []byte, error) {
-	headerLen, err := frameHeaderLenForVersion(c.config.version)
+	headerLen, err := c.headerLen()
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}

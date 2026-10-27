@@ -36,7 +36,7 @@ func TestConnectionAndStreamDebugState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMessage: %v", err)
 	}
-	raw, err := newRawMessageFromPayload(conn.config.codecID, payload)
+	raw, err := newRawMessageFromPayload(conn.config.codec, payload)
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}

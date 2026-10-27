@@ -41,7 +41,7 @@ func TestStreamPeekWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMap: %v", err)
 	}
-	raw, err := newRawMessageFromPayload(CodecMsgpackMap, payload)
+	raw, err := newRawMessageFromPayload(mustCodec(t, CodecMsgpackMap), payload)
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestStreamRecvInterfaceUsesRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMap: %v", err)
 	}
-	raw, err := newRawMessageFromPayload(CodecMsgpackMap, payload)
+	raw, err := newRawMessageFromPayload(mustCodec(t, CodecMsgpackMap), payload)
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestStreamRecvInterfaceUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMap: %v", err)
 	}
-	raw, err := newRawMessageFromPayload(CodecMsgpackMap, payload)
+	raw, err := newRawMessageFromPayload(mustCodec(t, CodecMsgpackMap), payload)
 	if err != nil {
 		t.Fatalf("newRawMessageFromPayload: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestStreamTypeMismatchCloses(t *testing.T) {
 	}
 	conn.streams[1] = &StreamContext{stream: stream}
 
-	stream.inbox <- rawMessage{Wire: "am.test.Other", Codec: CodecMsgpackMap}
+	stream.inbox <- rawMessage{Wire: "am.test.Other", Codec: mustCodec(t, CodecMsgpackMap)}
 	_, err := stream.Recv[expectedMsg]()
 	var mismatch ErrTypeMismatch
 	if !errors.As(err, &mismatch) {

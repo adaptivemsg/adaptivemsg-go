@@ -42,6 +42,11 @@
 //	type Ping struct{ Text string `am:"text"` }
 //	type Pong struct{ Text string `am:"text"` }
 //
+//	// A Handle method makes Ping a request the server answers.
+//	func (p *Ping) Handle(ctx *adaptivemsg.StreamContext) (adaptivemsg.Message, error) {
+//		return &Pong{Text: p.Text}, nil
+//	}
+//
 //	adaptivemsg.Register[Ping]()
 //	adaptivemsg.Register[Pong]()
 //
@@ -51,11 +56,6 @@
 //			return nil
 //		}).
 //		Serve("tcp://0.0.0.0:9000")
-//
-//	// Meanwhile, register a handler that echoes Ping → Pong:
-//	adaptivemsg.Handle(func(ctx *adaptivemsg.StreamContext, p *Ping) (*Pong, error) {
-//		return &Pong{Text: p.Text}, nil
-//	})
 //
 //	// ── client ──
 //	conn, err := adaptivemsg.NewClient().

@@ -200,22 +200,11 @@ func (e ErrInvalidMessage) Error() string {
 	return e.Reason
 }
 
-// ErrNoCommonVersion indicates that no protocol version overlap exists between
-// the client and server. The fields show each side's supported version range.
-type ErrNoCommonVersion struct {
-	// ClientMin is the minimum protocol version supported by the client.
-	ClientMin byte
-	// ClientMax is the maximum protocol version supported by the client.
-	ClientMax byte
-	// ServerMin is the minimum protocol version supported by the server.
-	ServerMin byte
-	// ServerMax is the maximum protocol version supported by the server.
-	ServerMax byte
-}
+// ErrServerClosed is returned by [Server.Serve] after [Server.Shutdown].
+type ErrServerClosed struct{}
 
-func (e ErrNoCommonVersion) Error() string {
-	return fmt.Sprintf("no common protocol version: client %d-%d, server %d-%d",
-		e.ClientMin, e.ClientMax, e.ServerMin, e.ServerMax)
+func (e ErrServerClosed) Error() string {
+	return "server closed"
 }
 
 // ErrUnsupportedTransport indicates that a required transport feature is

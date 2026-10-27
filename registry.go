@@ -1,8 +1,10 @@
 package adaptivemsg
 
 import (
+	"maps"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 type handlerFunc func(*StreamContext, Message) (Message, error)
@@ -13,17 +15,25 @@ type handler interface {
 
 var handlerType = reflect.TypeOf((*handler)(nil)).Elem()
 
+// registry maps wire names to message types and handlers. Every message read
+// looks them up, so the maps are never changed in place: registering replaces
+// them with updated copies, and lookups take no lock.
 type registry struct {
-	mu       sync.RWMutex
+	mu    sync.Mutex
+	types atomic.Pointer[registryTypes]
+}
+
+type registryTypes struct {
 	handlers map[string]handlerFunc
 	messages map[string]reflect.Type
 }
 
 func newRegistry() *registry {
-	reg := &registry{
-		handlers: make(map[string]handlerFunc),
-		messages: make(map[string]reflect.Type),
-	}
+	reg := &registry{}
+	reg.types.Store(&registryTypes{
+		handlers: map[string]handlerFunc{},
+		messages: map[string]reflect.Type{},
+	})
 	_, _, _ = reg.registerMessage(&OkReply{})
 	_, _, _ = reg.registerMessage(&ErrorReply{})
 	return reg
@@ -39,18 +49,8 @@ func cloneRegistry(src *registry) *registry {
 	if src == nil {
 		return newRegistry()
 	}
-	src.mu.RLock()
-	defer src.mu.RUnlock()
-	reg := &registry{
-		handlers: make(map[string]handlerFunc, len(src.handlers)),
-		messages: make(map[string]reflect.Type, len(src.messages)),
-	}
-	for wire, handler := range src.handlers {
-		reg.handlers[wire] = handler
-	}
-	for wire, typ := range src.messages {
-		reg.messages[wire] = typ
-	}
+	reg := &registry{}
+	reg.types.Store(src.types.Load())
 	return reg
 }
 
@@ -64,36 +64,35 @@ func (r *registry) registerMessage(proto Message) (string, reflect.Type, error) 
 		return "", nil, err
 	}
 	r.mu.Lock()
-	r.messages[wire] = t
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	old := r.types.Load()
+	messages := maps.Clone(old.messages)
+	messages[wire] = t
+	r.types.Store(&registryTypes{handlers: old.handlers, messages: messages})
 	return wire, t, nil
 }
 
 func (r *registry) registerHandler(wire string, handler handlerFunc) {
 	r.mu.Lock()
-	r.handlers[wire] = handler
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	old := r.types.Load()
+	handlers := maps.Clone(old.handlers)
+	handlers[wire] = handler
+	r.types.Store(&registryTypes{handlers: handlers, messages: old.messages})
 }
 
 func (r *registry) handler(wire string) (handlerFunc, bool) {
-	r.mu.RLock()
-	h, ok := r.handlers[wire]
-	r.mu.RUnlock()
+	h, ok := r.types.Load().handlers[wire]
 	return h, ok
 }
 
 func (r *registry) message(wire string) (reflect.Type, bool) {
-	r.mu.RLock()
-	typ, ok := r.messages[wire]
-	r.mu.RUnlock()
+	typ, ok := r.types.Load().messages[wire]
 	return typ, ok
 }
 
 func (r *registry) hasHandlers() bool {
-	r.mu.RLock()
-	count := len(r.handlers)
-	r.mu.RUnlock()
-	return count > 0
+	return len(r.types.Load().handlers) > 0
 }
 
 func newMessageForReflectType(t reflect.Type) (Message, error) {
@@ -179,8 +178,9 @@ func registerGlobalTypes(protos ...Message) error {
 // the global message registry. If T implements the handler interface
 // (Handle(*StreamContext) (Message, error)), its handler is also registered.
 //
-// Registration must happen before [Client.Connect] or [Server.Serve] since
-// connections snapshot the registry at creation time.
+// Registration must happen before [NewClient] or [NewServer], which take a
+// snapshot of the registry; later registrations are not seen by that Client
+// or Server.
 //
 // Returns [ErrInvalidMessage] if T is not a valid message type.
 func Register[T any]() error {
